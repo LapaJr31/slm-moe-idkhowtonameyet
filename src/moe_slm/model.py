@@ -1,0 +1,371 @@
+import hashlib
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.nn.attention.flex_attention import flex_attention, create_block_mask
+
+
+flex_attention = torch.compile(flex_attention)  # ty:ignore[invalid-assignment]
+_MASK_CACHE_MAX = 64
+_MASK_CACHE: dict = {}
+
+
+def _mask_cache_put(key, value):
+    if len(_MASK_CACHE) >= _MASK_CACHE_MAX:
+        _MASK_CACHE.pop(next(iter(_MASK_CACHE)))
+    _MASK_CACHE[key] = value
+    return value
+
+
+def _mask_fingerprint(attention_mask: torch.Tensor):
+    m = attention_mask.detach().to(torch.bool)
+    digest = hashlib.blake2b(m.cpu().numpy().tobytes(), digest_size=16).hexdigest()
+    return tuple(m.shape), str(m.device), digest
+
+
+def causal_mask(b, h, q_idx, kv_idx):
+    return q_idx >= kv_idx
+
+
+def get_causal_block_mask(seq_len: int, device):
+    key = ("flex_causal", seq_len, str(device))
+    mask = _MASK_CACHE.get(key)
+    if mask is None:
+        mask = _mask_cache_put(
+            key,
+            create_block_mask(
+                causal_mask,
+                B=None,
+                H=None,
+                Q_LEN=seq_len,
+                KV_LEN=seq_len,
+                device=device,
+            ),
+        )
+    return mask
+
+
+def get_padded_block_mask(attention_mask: torch.Tensor):
+    key = ("flex_padded", *_mask_fingerprint(attention_mask))
+    mask = _MASK_CACHE.get(key)
+    if mask is None:
+        B, T = attention_mask.shape
+        am = attention_mask.detach()
+
+        def mask_mod(b, h, q_idx, kv_idx):
+            return (q_idx >= kv_idx) & (am[b, kv_idx] != 0)
+
+        mask = _mask_cache_put(
+            key,
+            create_block_mask(
+                mask_mod,
+                B=B,
+                H=None,
+                Q_LEN=T,
+                KV_LEN=T,
+                device=am.device,
+            ),
+        )
+    return mask
+
+
+def get_sdpa_additive_mask(attention_mask: torch.Tensor, dtype: torch.dtype):
+    key = ("sdpa_additive", *_mask_fingerprint(attention_mask), str(dtype))
+    mask = _MASK_CACHE.get(key)
+    if mask is None:
+        B, T = attention_mask.shape
+        am = attention_mask.detach().to(torch.bool)
+        allow = torch.ones(T, T, dtype=torch.bool, device=am.device).tril()
+        allow = allow & am[:, None, None, :]
+
+        fully_masked = am.cumsum(-1) == 0                       # [B, T]
+        diag = torch.eye(T, dtype=torch.bool, device=am.device)[None, None]
+        allow = allow | (diag & fully_masked[:, None, :, None])  # [B, 1, T, T]
+        mask = _mask_cache_put(
+            key,
+            torch.zeros(B, 1, T, T, dtype=dtype, device=am.device).masked_fill_(
+                ~allow, torch.finfo(dtype).min
+            ),
+        )
+    return mask
+
+
+def make_padded_causal_block_mask(attention_mask: torch.Tensor):
+    if bool(attention_mask.all()):
+        return get_causal_block_mask(attention_mask.shape[-1], attention_mask.device)
+    return get_padded_block_mask(attention_mask)
+
+
+class RotaryPositionalEmbeddings(nn.Module):
+    inv_freq: torch.Tensor
+    cos_cached: torch.Tensor
+    sin_cached: torch.Tensor
+
+    def __init__(self, dim: int, base: int = 10_000, max_seq_len: int = 8192):
+        super().__init__()
+        assert dim % 2 == 0
+        self.dim = dim
+        self.base = base
+
+        inv_freq = 1.0 / (
+            self.base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim)
+        )
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self.register_buffer("cos_cached", None, persistent=False)
+        self.register_buffer("sin_cached", None, persistent=False)
+        self._capacity = 0
+        self._build_cache(max_seq_len)
+
+    def _build_cache(self, capacity: int) -> None:
+        t = torch.arange(capacity, device=self.inv_freq.device, dtype=torch.float32)
+        freqs = torch.outer(t, self.inv_freq)
+        angles = torch.cat((freqs, freqs), dim=-1)
+        self.cos_cached = angles.cos()
+        self.sin_cached = angles.sin()
+        self._capacity = capacity
+
+    def _ensure_capacity(self, seq_len: int) -> None:
+        if seq_len > self._capacity:
+            self._build_cache(max(seq_len, 2 * self._capacity))
+
+    @staticmethod
+    def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+        x1, x2 = x.chunk(2, dim=-1)
+        return torch.cat((-x2, x1), dim=-1)
+
+    def forward(self, q, k, position_ids=None):
+        B, _, T, D = q.shape
+        assert D == self.dim
+        assert k.shape[0] == B and k.shape[-2:] == (T, D)
+
+        self._ensure_capacity(T)
+
+        if position_ids is None:
+            cos = self.cos_cached[:T].view(1, 1, T, D)
+            sin = self.sin_cached[:T].view(1, 1, T, D)
+        else:
+            pos = position_ids.long()
+            cos = self.cos_cached[pos]
+            sin = self.sin_cached[pos]
+            if pos.ndim == 1:
+                cos = cos.view(1, 1, T, D)
+                sin = sin.view(1, 1, T, D)
+            else:
+                cos = cos.unsqueeze(1)
+                sin = sin.unsqueeze(1)
+
+        q = q * cos.to(q.dtype) + self._rotate_half(q) * sin.to(q.dtype)
+        k = k * cos.to(k.dtype) + self._rotate_half(k) * sin.to(k.dtype)
+        return q, k
+
+#todo
+class KVcache(nn.Module):
+    def __init__(self, d_size, n_layers, n_kv_heads, max_seq_len, dtype, device, max_batch_size):
+        pass
+
+    def update(self, layer_idx, k_new, v_new):
+        pass
+
+    def get(self, layer_idx):
+        pass
+
+    def reset(self):
+        pass
+
+class GQAAttention(nn.Module):
+    def __init__(self, d_model=1024, n_q_heads=16, n_kv_heads=4,
+                 max_seq_len=8192, attn_implementation="flex"):
+        super().__init__()
+        assert d_model % n_q_heads == 0
+        assert n_q_heads % n_kv_heads == 0
+        assert attn_implementation in ("flex", "sdpa")
+
+        self.n_q_heads = n_q_heads
+        self.n_kv_heads = n_kv_heads
+        self.head_dim = d_model // n_q_heads
+        self.attn_implementation = attn_implementation
+        self.enable_gqa = n_q_heads != n_kv_heads
+
+        self.q_proj = nn.Linear(d_model, n_q_heads * self.head_dim, bias=False)
+        self.k_proj = nn.Linear(d_model, n_kv_heads * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(d_model, n_kv_heads * self.head_dim, bias=False)
+        self.o_proj = nn.Linear(d_model, d_model, bias=False)
+
+        self.rope = RotaryPositionalEmbeddings(
+            dim=self.head_dim, max_seq_len=max_seq_len
+        )
+
+
+    def forward(self, x, block_mask, attention_mask, position_ids):
+        B, T, _ = x.shape
+
+        q = self.q_proj(x).view(
+            B, T, self.n_q_heads, self.head_dim
+        ).transpose(1, 2)
+        k = self.k_proj(x).view(
+            B, T, self.n_kv_heads, self.head_dim
+        ).transpose(1, 2)
+        v = self.v_proj(x).view(
+            B, T, self.n_kv_heads, self.head_dim
+        ).transpose(1, 2)
+
+        q, k = self.rope(q, k, position_ids)
+
+        if self.attn_implementation == "flex":
+            y = flex_attention(
+                q, k, v,
+                block_mask=block_mask,
+                enable_gqa=self.enable_gqa,
+            )
+        elif attention_mask is None:
+            y = F.scaled_dot_product_attention(
+                q, k, v, is_causal=True, enable_gqa=self.enable_gqa
+            )
+        else:
+            y = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=get_sdpa_additive_mask(attention_mask, q.dtype),
+                enable_gqa=self.enable_gqa,
+            )
+
+        y = y.transpose(1, 2).contiguous().view(B, T, -1)
+        return self.o_proj(y)
+
+class BatchedSwiGLUMoE(nn.Module):
+    def __init__(self, num_experts: int, d_ffn: int, d_model: int = 1024, top_k: int = 2):
+        super().__init__()
+        hidden_dim = int(2 * d_ffn / 3)
+        self.top_k, self.num_experts, self.hidden_dim = top_k, num_experts, hidden_dim
+        self.router = nn.Linear(d_model, num_experts, bias=False)
+        self.w13 = nn.Parameter(torch.empty(num_experts, 2 * hidden_dim, d_model))
+        self.w2  = nn.Parameter(torch.empty(num_experts, d_model, hidden_dim))
+        for p in (self.w13, self.w2):
+            nn.init.kaiming_uniform_(p, a=5**0.5)
+
+    @torch.compiler.disable
+    def forward(self, x):
+        scores = self.router(x).softmax(-1)
+        topk_scores, topk_ids = scores.topk(self.top_k, -1)
+
+        flat_ids = topk_ids.reshape(-1)
+        flat_scores = topk_scores.reshape(-1)
+        order = flat_ids.argsort()
+        expert_sorted = flat_ids[order]
+        token_idx = order // self.top_k
+        x_sorted = x[token_idx]
+
+        counts = torch.bincount(expert_sorted, minlength=self.num_experts)
+        offs = counts.cumsum(0, dtype=torch.int32)
+
+        #gemm 1
+        h13 = torch._grouped_mm(x_sorted, self.w13.transpose(-1, -2), offs=offs)
+        gate, up = h13.split(self.hidden_dim, dim=-1)
+        h2 = F.silu(gate) * up
+
+        # gemm 2
+        h3 = torch._grouped_mm(h2, self.w2.transpose(-1, -2), offs=offs)
+
+        out = torch.zeros_like(x)
+        out.index_add_(0, token_idx, h3 * flat_scores[order, None])
+        return out
+
+class RMSNorm(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        dtype = x.dtype
+        x = x.float()
+        x = x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+        return self.weight.to(dtype) * x.to(dtype)
+
+
+class TransformerBlock(nn.Module):
+    def __init__(self, d_model: int, n_q_heads: int, n_kv_heads: int,
+                 num_experts: int, d_ffn: int, top_k: int,
+                 max_seq_len: int = 8192, attn_implementation: str = "flex"):
+        super().__init__()
+        self.attn_norm = RMSNorm(d_model)
+        self.attn = GQAAttention(d_model, n_q_heads, n_kv_heads,
+                                 max_seq_len, attn_implementation)
+        self.moe_norm = RMSNorm(d_model)
+        self.moe = BatchedSwiGLUMoE(num_experts, d_ffn, d_model, top_k)
+
+    def forward(self, x, block_mask, attention_mask, position_ids):
+        x = x + self.attn(self.attn_norm(x), block_mask, attention_mask, position_ids)
+
+        B, T, D = x.shape
+        moe_out = self.moe(self.moe_norm(x).view(B * T, D))
+        return x + moe_out.view(B, T, D)
+
+
+class MoESLM(nn.Module):
+    def __init__(
+        self,
+        vocab_size: int,
+        d_model: int = 1024,
+        n_layers: int = 12,
+        n_q_heads: int = 16,
+        n_kv_heads: int = 4,
+        num_experts: int = 8,
+        d_ffn: int = 4224,
+        top_k: int = 2,
+        tie_embeddings: bool = True,
+        max_seq_len: int = 8192,
+        attn_implementation: str = "flex",
+    ):
+        super().__init__()
+        assert d_model % n_q_heads == 0
+
+        self.attn_implementation = attn_implementation
+
+        self.tok_emb = nn.Embedding(vocab_size, d_model)
+        nn.init.normal_(self.tok_emb.weight, mean=0.0, std=0.02)
+
+        self.blocks = nn.ModuleList([
+            TransformerBlock(d_model, n_q_heads, n_kv_heads,
+                             num_experts, d_ffn, top_k,
+                             max_seq_len, attn_implementation)
+            for _ in range(n_layers)
+        ])
+        self.norm = RMSNorm(d_model)
+        self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
+        if tie_embeddings:
+            self.lm_head.weight = self.tok_emb.weight
+
+    def forward(self, input_ids, attention_mask=None):
+        if attention_mask is not None and bool(attention_mask.all()):
+            attention_mask = None
+
+        flex_path = self.attn_implementation == "flex"
+
+        if attention_mask is None:
+
+            position_ids = None
+            block_mask = (
+                get_causal_block_mask(input_ids.shape[-1], input_ids.device)
+                if flex_path
+                else None
+            )
+            padding_mask = None
+        else:
+
+            position_ids = attention_mask.long().cumsum(dim=-1) - 1
+            position_ids = position_ids.masked_fill(attention_mask == 0, 0)
+            block_mask = get_padded_block_mask(attention_mask) if flex_path else None
+            padding_mask = attention_mask
+
+        x = self.tok_emb(input_ids)
+        for block in self.blocks:
+            x = block(x, block_mask, padding_mask, position_ids)
+        x = self.norm(x)
+        return self.lm_head(x)
+
+
+def compile_model(model: MoESLM, dynamic: bool = True, mode: str | None = None) -> MoESLM:
+    for block in model.blocks:
+        block.compile(dynamic=dynamic, mode=mode)
+    return model

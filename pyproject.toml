@@ -1,0 +1,68 @@
+[project]
+name = "moe_slm"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = "==3.13.*"
+dependencies = [
+    "numpy>=2.5.2",
+    "scikit-learn>=1.9.1",
+]
+
+[project.scripts]
+moe_slm = "moe_slm:main"
+
+[build-system]
+requires = ["uv_build>=0.13.5,<0.14.0"]
+build-backend = "uv_build"
+
+[project.optional-dependencies]
+cpu = [
+    "torch>=2.13.0",
+    "torchvision>=0.28.0",
+]
+cu130 = [
+    "torch>=2.13.0",
+    "torchvision>=0.28.0",
+]
+
+[dependency-groups]
+dev = [
+    "ipykernel>=7.3.0",
+    "ipywidgets>=8.1.8",
+]
+
+[tool.uv]
+
+conflicts = [
+    [
+        { extra = "cpu" },
+        { extra = "cu130" },
+    ],
+]
+
+cache-dir = "/tmp/uv-cache"
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+prerelease = "allow"
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cpu", extra = "cpu" },
+    { index = "pytorch-cu130", extra = "cu130" },
+]
+torchvision = [
+    { index = "pytorch-cpu", extra = "cpu" },
+    { index = "pytorch-cu130", extra = "cu130" },
+]
+
+[tool.uv.workspace]
+exclude = ["gpu-envs/*"]
