@@ -198,6 +198,7 @@ class GQAAttention(nn.Module):
 
 
     def forward(self, x, block_mask, attention_mask, position_ids):
+
         B, T, _ = x.shape
 
         q = self.q_proj(x).view(
@@ -245,7 +246,7 @@ class BatchedSwiGLUMoE(nn.Module):
 
     @torch.compiler.disable
     def forward(self, x):
-        scores = self.router(x).softmax(-1)
+        scores = self.router(x).float().softmax(-1)
         topk_scores, topk_ids = scores.topk(self.top_k, -1)
 
         flat_ids = topk_ids.reshape(-1)
@@ -266,9 +267,13 @@ class BatchedSwiGLUMoE(nn.Module):
         # gemm 2
         h3 = torch._grouped_mm(h2, self.w2.transpose(-1, -2), offs=offs)
 
+        P = scores.mean(dim=0)
+        f = counts.detach().float() / flat_ids.numel()
+        aux = self.num_experts * (f*P).sum()
+
         out = torch.zeros_like(x)
         out.index_add_(0, token_idx, h3 * flat_scores[order, None])
-        return out
+        return (out, aux)
 
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
@@ -298,8 +303,8 @@ class TransformerBlock(nn.Module):
         x = x + self.attn(self.attn_norm(x), block_mask, attention_mask, position_ids)
 
         B, T, D = x.shape
-        moe_out = self.moe(self.moe_norm(x).view(B * T, D))
-        return x + moe_out.view(B, T, D)
+        moe_out, aux = self.moe(self.moe_norm(x).view(B * T, D))
+        return x + moe_out.view(B, T, D), aux
 
 
 class MoESLM(nn.Module):
@@ -359,10 +364,12 @@ class MoESLM(nn.Module):
             padding_mask = attention_mask
 
         x = self.tok_emb(input_ids)
+        aux_total = x.new_zeros(())
         for block in self.blocks:
-            x = block(x, block_mask, padding_mask, position_ids)
+            x, block_aux = block(x, block_mask, padding_mask, position_ids)
+            aux_total = aux_total + block_aux
         x = self.norm(x)
-        return self.lm_head(x)
+        return self.lm_head(x), aux_total
 
 
 def compile_model(model: MoESLM, dynamic: bool = True, mode: str | None = None) -> MoESLM:
