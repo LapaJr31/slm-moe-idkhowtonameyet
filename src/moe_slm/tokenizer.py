@@ -4,6 +4,7 @@ import pickle
 from collections import defaultdict
 
 from datasets import load_dataset
+from tokenizers import pre_tokenizers
 from transformers import AutoTokenizer
 
 
@@ -36,15 +37,16 @@ class BPETokenizer:
         self._merge_ranks = {pair: i for i, pair in enumerate(self.merges)}
 
     def to_huggingface(self):
-        from tokenizers import Tokenizer, models, pre_tokenizers, decoders
+        from tokenizers import Tokenizer, models, decoders
         from transformers import PreTrainedTokenizerFast
 
         vocab = {tok: i for i, tok in enumerate(self.vocab)}
 
-        byte_chars = [chr(b) for b in range(256)]
-        byte_chars = pre_tokenizers.ByteLevel.alphabet()
+        # byte chars unseen during training get ids after the merges so every
+        # possible byte still encodes; normally a no-op because compute_vocab
+        # seeds the full byte alphabet
         next_id = len(vocab)
-        for ch in byte_chars:
+        for ch in pre_tokenizers.ByteLevel.alphabet():
             if ch not in vocab:
                 vocab[ch] = next_id
                 next_id += 1
@@ -139,11 +141,13 @@ class BPETokenizer:
 
     def compute_vocab(self):
 
+        observed = set(self.alphabet)
         for word in self.wordfreq.keys():
-            for letter in word:
-                if letter not in self.alphabet:
-                    self.alphabet.append(letter)
-        self.alphabet.sort()
+            observed.update(word)
+        # seed the full byte-level alphabet so every possible byte has a token
+        # even when unseen in the corpus; keeps the exported vocab exactly
+        # `vocab_size` tokens so ids stay within the model's embedding bounds
+        self.alphabet = sorted(observed | set(pre_tokenizers.ByteLevel.alphabet()))
 
         vocab = self.special_tokens.copy() + self.alphabet.copy()
         splits = {word: [c for c in word] for word in self.wordfreq.keys()}
@@ -166,6 +170,7 @@ class BPETokenizer:
         heap = [(-freq, pair) for pair, freq in self.pair_counts.items() if freq > 0]
         heapq.heapify(heap)
 
+        n_target = self.vocab_size - len(self.vocab)
         while len(self.vocab) < self.vocab_size:
             while heap:
                 neg_freq, pair = heapq.heappop(heap)
@@ -177,6 +182,8 @@ class BPETokenizer:
             merged = a + b
             self.merges[pair] = merged
             self.vocab.append(merged)
+            if len(self.merges) % 10000 == 0:
+                print(f"merges: {len(self.merges)}/{n_target}", flush=True)
 
             changed_pairs = set()
             for word in pair_to_words.pop(pair, ()):
@@ -213,6 +220,11 @@ class BPETokenizer:
                 if freq > 0:
                     heapq.heappush(heap, (-freq, p))
 
+        if len(self.merges) < n_target:
+            print(
+                f"pair counts exhausted at {len(self.merges)} merges (wanted {n_target})",
+                flush=True,
+            )
 
     def tokenize(self, text):
         pre_tokenize_result = self.tokenizer.backend_tokenizer.pre_tokenizer.pre_tokenize_str(text)
@@ -265,11 +277,12 @@ def train_bpe_on_mix(
 
     if cache_name:
         key = hashlib.blake2b(
-            f"{cache_name}|{budget}".encode(), digest_size=16
+            f"{cache_name}|{budget}|{ref_tokenizer}".encode(), digest_size=16
         ).hexdigest()
         cache_dir = os.path.join(".cache", "moe_slm_bpe_wordfreq", key)
         cache_file = os.path.join(cache_dir, "wordfreq.pkl")
         if os.path.exists(cache_file):
+            print(f"loading wordfreq cache {cache_file}", flush=True)
             with open(cache_file, "rb") as f:
                 wordfreq = pickle.load(f)
             return BPETokenizer(vocab_size=vocab_size, wordfreq=wordfreq)
@@ -278,6 +291,7 @@ def train_bpe_on_mix(
     wordfreq = defaultdict(int)
     counted = 0
     batch = []
+    n_batches = 0
 
     def flush(texts):
         nonlocal counted
@@ -292,7 +306,14 @@ def train_bpe_on_mix(
         batch.append(text)
         if len(batch) >= batch_size:
             flush(batch)
+            n_batches += 1
             batch = []
+            if n_batches % 100 == 0:
+                print(
+                    f"wordfreq: {counted/1e6:.0f}M/{budget/1e6:.0f}M tokens, "
+                    f"{len(wordfreq):,} unique words",
+                    flush=True,
+                )
             if counted >= budget:
                 break
     if batch and counted < budget:

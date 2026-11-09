@@ -117,12 +117,12 @@ def tokenize_to_disk(
     mix,
     tokenizer,
     path,
-    seq_len=1024,
+    seq_len=2048,
     text_column="text",
     batch_size=512,
     add_eos=True,
 ):
-    if os.path.exists(path):
+    if os.path.exists(os.path.join(str(path), "dataset_info.json")):
         print(f"tokenized dataset already exists at {path}, loading it")
         return Dataset.load_from_disk(path)
 
@@ -228,6 +228,8 @@ class Dataset_Mixed:
                 mix = interleave_datasets(
                     sources,
                     probabilities=probabilities,
+                    seed=self.seed,
+                    stopping_strategy="all_exhausted_without_replacement",
                 )
             else:
                 mix = load_exact(
@@ -244,10 +246,7 @@ class Dataset_Mixed:
         self.dataset = mix
 
     def tokenize(self, dataset, tokenizer, path = Path(__file__).resolve().parents[2] / "dataset"):
-        dataset = self.dataset
-        tokenizer = self.tokenizer
-
-        ds = tokenize_to_disk(dataset, tokenizer, path=path)
+        return tokenize_to_disk(dataset, tokenizer, path=path)
 
     def __iter__(self):
         return iter(self.dataset)
