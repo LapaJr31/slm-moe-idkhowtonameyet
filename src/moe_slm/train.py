@@ -147,42 +147,54 @@ class preTrain:
         )
 
 
-    def run_epoch(self, model, loader, optimizer_adamw, optimizer_muon, criterion):
-        model.train()
+    def run_epoch(
+        self,
+        model,
+        loader,
+        optimizer_adamw, scheduler_adamw,
+        optimizer_muon, scheduler_muon,
+        criterion,
+        train = True,
+    ):
+        model.train(train)
         total_loss = 0.0
 
         for batch in loader:
-            batch = {
-                key: value.to(self.device, non_blocking=True)
-                for key, value in batch.items()
-            }
+            batch = {key: value.to(self.device, non_blocking=True) for key, value in batch.items()}
 
-            optimizer_adamw.zero_grad(set_to_none=True) ,optimizer_muon.zero_grad(set_to_none=True)
+            if train:
+                optimizer_adamw.zero_grad(set_to_none=True)
+                optimizer_muon.zero_grad(set_to_none=True)
 
-            with torch.autocast("cuda", dtype=torch.bfloat16):
-                logits, aux_loss = model(
-                    input_ids=batch["input_ids"],
-                    attention_mask=batch["attention_mask"]
+            with torch.set_grad_enabled(train):
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    logits, aux_loss = model(input_ids=batch["input_ids"])
+
+                lm_loss = criterion(
+                    logits[:, :-1].float().reshape(-1, logits.size(-1)),
+                    batch["input_ids"][:, 1:].reshape(-1),
                 )
+                loss = lm_loss + 0.01 * aux_loss.float()
 
-            lm_loss = criterion(
-                logits.float().reshape(-1, logits.size(-1)),
-                batch["labels"].reshape(-1)
-            )
-
-            loss = lm_loss + 0.01 * aux_loss.float()
-            loss.backward()
-            optimizer_adamw.step() ,optimizer_muon.step()
+                if train:
+                    loss.backward()
+                    optimizer_adamw.step()
+                    optimizer_muon.step()
+                    scheduler_adamw.step()
+                    scheduler_muon.step()
 
             total_loss += loss.detach().item()
 
+        if len(loader) == 0:
+            raise ValueError("DataLoader is empty")
+
+        return total_loss / len(loader)
 
     def train(self):
         pass
 
 #todo
 # unpack logits and axu
-# attention mask
 # train empty
 # model checkpointing
 # mlflow
