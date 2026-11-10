@@ -12,3 +12,4 @@ wheels/
 tokenizers/smol-data-1b-50k/
 dataset/
 test.py
+dataset.tar.zst

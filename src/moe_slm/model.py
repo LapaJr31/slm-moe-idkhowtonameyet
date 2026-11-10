@@ -325,6 +325,19 @@ class MoESLM(nn.Module):
         super().__init__()
         assert d_model % n_q_heads == 0
 
+        self.config = {
+            "vocab_size": vocab_size,
+            "d_model": d_model,
+            "n_layers": n_layers,
+            "n_q_heads": n_q_heads,
+            "n_kv_heads": n_kv_heads,
+            "num_experts": num_experts,
+            "d_ffn": d_ffn,
+            "top_k": top_k,
+            "tie_embeddings": tie_embeddings,
+            "max_seq_len": max_seq_len,
+            "attn_implementation": attn_implementation,
+        }
         self.attn_implementation = attn_implementation
 
         self.tok_emb = nn.Embedding(vocab_size, d_model)
