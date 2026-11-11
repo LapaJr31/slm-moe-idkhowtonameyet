@@ -11,6 +11,7 @@ from .train import preTrain
 
 VOCAB_SIZE = 50000
 SEQLEN = preTrain.SEQLEN
+SUBSAMPLE_TOKENS = 100e6
 
 
 def main():
@@ -25,6 +26,10 @@ def main():
         print(f"tokenizer already exists at {out}, loading it")
         print(f"loading dataset from {ds_path}")
         ds = load_from_disk(ds_path)
+        if SUBSAMPLE_TOKENS:
+            n_rows = int(SUBSAMPLE_TOKENS / SEQLEN)
+            ds = ds.select(range(n_rows))
+            print(f"subsampled to first {n_rows:,} rows (~{SUBSAMPLE_TOKENS/1e6:.0f}M tokens)")
     else:
         mix = Dataset_Mixed(
             testing=True,
@@ -48,6 +53,10 @@ def main():
         if have_dataset:
             print(f"loading dataset from {ds_path}")
             ds = load_from_disk(ds_path)
+            if SUBSAMPLE_TOKENS:
+                n_rows = int(SUBSAMPLE_TOKENS / SEQLEN)
+                ds = ds.select(range(n_rows))
+                print(f"subsampled to first {n_rows:,} rows (~{SUBSAMPLE_TOKENS/1e6:.0f}M tokens)")
         else:
             ds = mix.tokenize(mix.dataset, tok)
             print(f"tokenized dataset ready: {len(ds):,} x {SEQLEN}-token rows")
@@ -58,12 +67,12 @@ def main():
 
     model = MoESLM(
         vocab_size=VOCAB_SIZE,
-        d_model=256,
-        n_layers=6,
-        n_q_heads=8,
-        n_kv_heads=2,
-        num_experts=4,
-        d_ffn=1024,
+        d_model=1024,
+        n_layers=13,
+        n_q_heads=16,
+        n_kv_heads=4,
+        num_experts=8,
+        d_ffn=4224,
         top_k=2,
     )
     trainer = preTrain(ds, model, run_type="dry_run")

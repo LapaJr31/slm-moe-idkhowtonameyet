@@ -33,15 +33,32 @@ def _fmt_hms(sec: float) -> str:
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
 
 
+def chunked_cross_entropy(logits, targets, chunk=4096, ignore_index=-100):
+    B, T, V = logits.shape
+    flat_logits = logits[:, :-1].reshape(-1, V)
+    flat_targets = targets[:, 1:].reshape(-1)
+    n = flat_logits.shape[0]
+
+    total = flat_logits.new_zeros((), dtype=torch.float32)
+    for i in range(0, n, chunk):
+        li = flat_logits[i:i + chunk].float()
+        ti = flat_targets[i:i + chunk]
+        total = total + F.cross_entropy(li, ti, ignore_index=ignore_index, reduction="sum")
+    n_valid = (flat_targets != ignore_index).sum().clamp(min=1)
+    return total / n_valid
+
+
 class preTrain:
     EPOCHS = 1
     BATCH_SIZE = 16        # micro-batch
-    GRAD_ACCUM = 16        # effective batch 64
+    GRAD_ACCUM = 16        # effective batch BATCH_SIZE * GRAD_ACCUM
+    TIME_STEPS = 50        # how many optimizer steps to profile timing for
     AUX_COEF = 0.01       # load-balancing loss weight
     Z_COEF = 0.01         # router confidence penalty weight
-    LR_MUON = 0.02
-    LR_ADAMW = 3e-4
+    LR_MUON = 0.04
+    LR_ADAMW = 6e-4
     SEQLEN = 2048
+    CE_CHUNK = 8192       # positions per chunked-CE slice
     SAVE_EVERY = 100
     LOG_EVERY = 50
     CHECKPOINT_DIR = Path("checkpoints")
@@ -135,6 +152,8 @@ class preTrain:
 
         self.tokens_seen = 0
         self.total_tokens = 0
+
+        self.timing = {"bwd": 0.0, "opt": 0.0}
         self.start_epoch = 0
         self.best_val_loss = float("inf")
         self.CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
@@ -257,7 +276,7 @@ class preTrain:
             TextColumn("[yellow]Aux: {task.fields[aux_loss]:.4f}"),
             TextColumn("[yellow]Grad: {task.fields[grad_norm]:.3f}"),
             TextColumn("[yellow]Mem: {task.fields[gpu_mem_gb]:.2f}GB"),
-            TextColumn("[cyan]{task.fields[elapsed]}[/]:[magenta]{task.fields[eta]}[/]"),
+            TextColumn("[cyan]{task.fields[elapsed]}[/] | [magenta]eta {task.fields[eta]}[/]"),
             expand=False,
             refresh_per_second=2,
         ) as progress:
@@ -291,6 +310,16 @@ class preTrain:
                     (step + 1) % self.LOG_EVERY == 0
                     or step + 1 == n_steps
                 )
+
+                if train and step + 1 == self.TIME_STEPS:
+                    t = self.timing
+                    total = t["bwd"] + t["opt"]
+                    print(
+                        f"\n[timing over steps 5-{self.TIME_STEPS}, wall-clock incl. sync] "
+                        f"fwd+bwd+loss: {t['bwd']:.2f}s "
+                        f"({t['bwd']/total*100:.1f}%) | "
+                        f"optimizer: {t['opt']:.2f}s ({t['opt']/total*100:.1f}%)"
+                    )
                 if train:
                     self.adamw.zero_grad(set_to_none=True)
                     self.muon.zero_grad(set_to_none=True)
@@ -301,21 +330,23 @@ class preTrain:
                 step_z = torch.zeros_like(step_loss)
                 step_tok = 0
 
+                # skip the first few steps: they absorb torch.compile recompiles
+                profile = train and 5 <= step < self.TIME_STEPS
                 for batch in micros:
                     batch = {
                         k: v.to(self.device, non_blocking=True)
                         for k, v in batch.items()
                     }
 
+                    t0 = time.perf_counter()
                     with torch.set_grad_enabled(train):
                         with torch.autocast("cuda", dtype=self.precision):
                             logits, aux_loss, z_loss = self.model(
                                 input_ids=batch["input_ids"]
                             )
 
-                        lm_loss = self.criterion(
-                            logits[:, :-1].float().reshape(-1, logits.size(-1)),
-                            batch["input_ids"][:, 1:].reshape(-1),
+                        lm_loss = chunked_cross_entropy(
+                            logits, batch["input_ids"], chunk=self.CE_CHUNK
                         )
 
                         loss = (
@@ -325,6 +356,12 @@ class preTrain:
                         )
                         if train:
                             (loss / len(micros)).backward()
+                    if profile and self.device == "cuda":
+                        torch.cuda.synchronize()
+                    t1 = time.perf_counter()
+
+                    if profile:
+                        self.timing["bwd"] += t1 - t0
 
                     if train:
                         self.total_tokens += batch["input_ids"].numel()
@@ -346,6 +383,7 @@ class preTrain:
 
                 grad_norm = None
                 if train:
+                    t2 = time.perf_counter()
                     grad_norm = torch.nn.utils.clip_grad_norm_(
                         self.model.parameters(),
                         max_norm=float("inf"),
@@ -356,6 +394,11 @@ class preTrain:
 
                     self.schedule_adamw.step()
                     self.schedule_muon.step()
+
+                    if profile and self.device == "cuda":
+                        torch.cuda.synchronize()
+                    if profile:
+                        self.timing["opt"] += time.perf_counter() - t2
 
                     if (step + 1) % self.SAVE_EVERY == 0 or step + 1 == n_steps:
                         self.save_checkpoint("latest")
