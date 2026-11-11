@@ -128,6 +128,7 @@ class preTrain:
         )
 
         self.model = model
+        self.n_layers = model.config["n_layers"]
 
         self.optim_steps_train = len(self.train_dl)
         self.optim_steps_val = len(self.val_dl)
@@ -386,7 +387,7 @@ class preTrain:
                         tok_s=tok_s,
                         loss=loss.item(),
                         lm_loss=lm_loss.item(),
-                        aux_loss=aux_loss.item(),
+                        aux_loss=aux_loss.item() / self.n_layers,
                         grad_norm=(
                             grad_norm.item()
                             if grad_norm is not None
@@ -402,7 +403,7 @@ class preTrain:
                         mlflow.log_metrics({
                             "train/loss": loss.item(),
                             "train/lm_loss": lm_loss.item(),
-                            "train/aux_loss": aux_loss.item(),
+                            "train/aux_loss": aux_loss.item() / self.n_layers,
                             "train/z_loss": z_loss.item(),
                             "train/grad_norm": (
                                 grad_norm.item()
@@ -460,7 +461,7 @@ class preTrain:
                     f"{'-' * 40}\n"
                     f"Total Loss:     {epoch_loss:.4f}\n"
                     f"LM Loss:        {epoch_lm_loss:.4f}\n"
-                    f"Aux Loss:       {epoch_aux_loss:.4f}\n"
+                    f"Aux Loss:       {epoch_aux_loss / self.n_layers:.4f}\n"
                     f"Z Loss:         {epoch_z_loss:.4f}\n"
                     f"Perplexity:     {perplexity:.2f}\n"
                     f"Avg Throughput: {tokens_per_second:,.0f} tok/s\n"
@@ -473,7 +474,7 @@ class preTrain:
                 mlflow.log_metrics({
                     f"{prefix}/loss": epoch_loss,
                     f"{prefix}/lm_loss": epoch_lm_loss,
-                    f"{prefix}/aux_loss": epoch_aux_loss,
+                    f"{prefix}/aux_loss": epoch_aux_loss / self.n_layers,
                     f"{prefix}/z_loss": epoch_z_loss,
                     f"{prefix}/perplexity": perplexity,
                     f"{prefix}/tok_s": tokens_per_second,
