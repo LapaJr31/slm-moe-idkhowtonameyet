@@ -47,13 +47,13 @@ def chunked_cross_entropy(logits, targets, chunk=4096, ignore_index=-100):
 
 class preTrain:
     EPOCHS = 1
-    BATCH_SIZE = 8        # micro-batch
+    BATCH_SIZE = 16        # micro-batch
     GRAD_ACCUM = 16        # effective batch BATCH_SIZE * GRAD_ACCUM
     TIME_STEPS = 50        # how many optimizer steps to profile timing for
     AUX_COEF = 0.01       # load-balancing loss weight
     Z_COEF = 0.01         # router confidence penalty weight
-    LR_MUON = 0.02
-    LR_ADAMW = 3e-4
+    LR_MUON = 0.04
+    LR_ADAMW = 6e-4
     SEQLEN = 2048
     CE_CHUNK = 8192
     SAVE_EVERY = 100
@@ -85,7 +85,9 @@ class preTrain:
         model = model.to(self.device)
         model.gradient_checkpointing_enable()
 
+        print(f"Compiling model")
         model = compile_model(model, strategy="whole")
+        print(f"Finished compilation")
 
         if isinstance(dataset_tokenized, Dataset):
             dataset = dataset_tokenized
