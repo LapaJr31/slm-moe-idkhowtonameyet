@@ -20,3 +20,4 @@ mlflow_serve.sh
 mlflow.db
 out.log
 checkpoint.tar.zst
+mlartifacts/1/8ff3ba257e2440849b5c298dc22dc755/artifacts/checkpoints/
