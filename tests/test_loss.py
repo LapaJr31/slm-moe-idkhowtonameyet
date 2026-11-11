@@ -57,3 +57,14 @@ def test_chunked_ce_handles_ignore_index(device):
     )
     chunked = chunked_cross_entropy(logits, targets, chunk=3)
     assert torch.allclose(plain, chunked, atol=1e-6)
+
+
+@pytest.mark.parametrize("chunk", [1, 7, 100])
+def test_all_ignored_targets_have_zero_loss_and_gradients(device, chunk):
+    """An empty supervised batch must not introduce NaNs or update parameters."""
+    logits = torch.randn(2, 8, 13, device=device, requires_grad=True)
+    targets = torch.full((2, 8), -100, device=device)
+    loss = chunked_cross_entropy(logits, targets, chunk=chunk)
+    torch.testing.assert_close(loss, loss.new_zeros(()))
+    loss.backward()
+    torch.testing.assert_close(logits.grad, torch.zeros_like(logits))

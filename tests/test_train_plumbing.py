@@ -9,12 +9,28 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from conftest import tiny_model, random_batch, DEVICE
-from moe_slm.train import chunked_cross_entropy
+
+
+@pytest.fixture(autouse=True)
+def isolated_tracking(tmp_path):
+    """Checkpoint loading logs params and can implicitly open an MLflow run."""
+    import mlflow
+
+    previous_uri = mlflow.get_tracking_uri()
+    mlflow.set_tracking_uri(f"sqlite:///{tmp_path / 'mlflow.db'}")
+    mlflow.create_experiment(
+        "moe-slm-pretrain", artifact_location=(tmp_path / "artifacts").as_uri()
+    )
+    mlflow.set_experiment("moe-slm-pretrain")
+    try:
+        yield
+    finally:
+        mlflow.end_run()
+        mlflow.set_tracking_uri(previous_uri)
 
 
 def test_checkpoint_roundtrip_restores_exact_state(tmp_path):
-    """save_checkpoint → load_checkpoint must reproduce identical next-step
-    loss. Guards the optimizer-state/total_tokens restore path."""
+    """Restore model weights and trainer counters into a fresh model."""
     from moe_slm.train import preTrain
 
     m1 = tiny_model()
@@ -39,7 +55,6 @@ def test_checkpoint_roundtrip_restores_exact_state(tmp_path):
     assert path.exists()
 
     m2 = tiny_model()
-    m2.load_state_dict(m1.state_dict())  # same weights...
     trainer2 = preTrain.__new__(preTrain)
     trainer2.device = DEVICE
     trainer2.model = m2.to(DEVICE)
@@ -47,7 +62,7 @@ def test_checkpoint_roundtrip_restores_exact_state(tmp_path):
     trainer2.muon = torch.optim.AdamW(m2.parameters(), lr=1e-3)
     trainer2.schedule_adamw = torch.optim.lr_scheduler.LambdaLR(trainer2.adamw, lambda s: 1.0)
     trainer2.schedule_muon = torch.optim.lr_scheduler.LambdaLR(trainer2.muon, lambda s: 1.0)
-    trainer2.load_checkpoint(path)  # ...then ckpt overwrites with saved state
+    trainer2.load_checkpoint(path)
 
     assert trainer2.total_tokens == 12345
     assert trainer2.best_val_loss == 2.5
@@ -77,7 +92,7 @@ def test_grad_accum_scaling_matches_single_batch():
     targets = [b.roll(-1, dims=-1) for b in batches]
 
     # accumulate 4 micro-batches (CE only, aux/z deliberately excluded)
-    m1.train()
+    m1.eval()  # Gradients remain enabled; disable stochastic router jitter.
     for b, t in zip(batches, targets):
         logits, aux, z = m1(b)
         loss = F.cross_entropy(
@@ -88,7 +103,7 @@ def test_grad_accum_scaling_matches_single_batch():
     g_accum = m1.blocks[0].attn.q_proj.weight.grad.clone()
 
     # single concatenated batch
-    m2.train()
+    m2.eval()
     big_in = torch.cat(batches)
     big_tgt = torch.cat(targets)
     logits, aux, z = m2(big_in)
@@ -102,25 +117,22 @@ def test_grad_accum_scaling_matches_single_batch():
     assert torch.allclose(g_accum, g_single, atol=1e-4)
 
 
-def test_total_tokens_accounting():
-    """total_tokens counts train tokens only — the double-counting bug that
-    once crashed run_epoch."""
-    class Fake:
-        input_ids = torch.zeros(4, 8, dtype=torch.long)
-
-    tokens = Fake().input_ids.numel()
-    assert tokens == 32  # sanity of the test itself
-
-
 @pytest.mark.slow
-def test_training_smoke_loss_decreases():
-    """Full trainer on a tiny model, CPU-friendly: 30 steps, loss must drop
-    and no NaNs appear. Runs the real code path (dataloader, chunked CE,
-    optimizers, checkpointing)."""
-    from moe_slm.model import MoESLM
+def test_training_smoke_saves_checkpoint(tmp_path, monkeypatch):
+    """Exercise the trainer, optimizers, token accounting and checkpoint writes."""
     from moe_slm.train import preTrain
     from datasets import Dataset as HFDataset
 
+    # Compile correctness is covered separately; keep this plumbing test eager.
+    monkeypatch.setattr("moe_slm.train.compile_model", lambda model, **kwargs: model)
+    monkeypatch.setattr(preTrain, "CHECKPOINT_DIR", tmp_path / "checkpoints")
+    monkeypatch.setattr(preTrain, "BATCH_SIZE", 4)
+    monkeypatch.setattr(preTrain, "GRAD_ACCUM", 2)
+    monkeypatch.setattr(preTrain, "create_dataloader", staticmethod(
+        lambda dataset_slice, batch, num_workers, shuffle: DataLoader(
+            dataset_slice, batch_size=batch, shuffle=shuffle, num_workers=0
+        )
+    ))
     torch.manual_seed(0)
     vocab = 256
     seqlen = 64
@@ -128,7 +140,7 @@ def test_training_smoke_loss_decreases():
     data = torch.randint(1, vocab, (n_rows, seqlen))
     ds = HFDataset.from_dict({"input_ids": data.tolist()})
 
-    model = tiny_model(vocab_size=vocab, max_seq_len=seqlen)
+    model = tiny_model(vocab_size=vocab, max_seq_len=seqlen, attn_implementation="sdpa")
     trainer = preTrain(ds, model, seed=0, run_type="unittest")
     trainer.EPOCHS = 1
     trainer.BATCH_SIZE = 4
@@ -142,5 +154,5 @@ def test_training_smoke_loss_decreases():
     trainer.train()
 
     assert math.isfinite(trainer.best_val_loss)
-    assert trainer.total_tokens > 0
+    assert trainer.total_tokens == int(n_rows * 0.90) * seqlen
     assert (trainer.CHECKPOINT_DIR / "best.pt").exists()
