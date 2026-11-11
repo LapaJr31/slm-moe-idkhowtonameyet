@@ -35,9 +35,10 @@ def _fmt_hms(sec: float) -> str:
 
 class preTrain:
     EPOCHS = 1
-    BATCH_SIZE = 8        # micro-batch
+    BATCH_SIZE = 16        # micro-batch
     GRAD_ACCUM = 16        # effective batch 64
-    AUX_COEF = 0.05       # load-balancing loss weight
+    AUX_COEF = 0.01       # load-balancing loss weight
+    Z_COEF = 0.01         # router confidence penalty weight
     LR_MUON = 0.02
     LR_ADAMW = 3e-4
     SEQLEN = 2048
@@ -59,6 +60,7 @@ class preTrain:
             "lr_adamw": self.LR_ADAMW,
             "seed": seed,
             "aux_coef": self.AUX_COEF,
+            "z_coef": self.Z_COEF,
             **{f"model/{k}": v for k, v in model.config.items()},
             "model/param_count": sum(p.numel() for p in model.parameters()),
         })
@@ -240,6 +242,7 @@ class preTrain:
         total_loss = torch.zeros((), device=self.device)
         total_aux_loss = torch.zeros_like(total_loss)
         total_lm_loss = torch.zeros_like(total_loss)
+        total_z_loss = torch.zeros_like(total_loss)
 
         total_tokens = 0
 
@@ -294,6 +297,7 @@ class preTrain:
                 step_loss = torch.zeros((), device=self.device)
                 step_aux = torch.zeros_like(step_loss)
                 step_lm = torch.zeros_like(step_loss)
+                step_z = torch.zeros_like(step_loss)
                 step_tok = 0
 
                 for batch in micros:
@@ -304,7 +308,7 @@ class preTrain:
 
                     with torch.set_grad_enabled(train):
                         with torch.autocast("cuda", dtype=self.precision):
-                            logits, aux_loss = self.model(
+                            logits, aux_loss, z_loss = self.model(
                                 input_ids=batch["input_ids"]
                             )
 
@@ -313,7 +317,11 @@ class preTrain:
                             batch["input_ids"][:, 1:].reshape(-1),
                         )
 
-                        loss = lm_loss + self.AUX_COEF * aux_loss.float()
+                        loss = (
+                            lm_loss
+                            + self.AUX_COEF * aux_loss.float()
+                            + self.Z_COEF * z_loss.float()
+                        )
                         if train:
                             (loss / len(micros)).backward()
 
@@ -323,15 +331,17 @@ class preTrain:
                     step_loss += loss.detach()
                     step_aux += aux_loss.detach()
                     step_lm += lm_loss.detach()
+                    step_z += z_loss.detach()
 
-                loss, lm_loss, aux_loss = (
+                loss, lm_loss, aux_loss, z_loss = (
                     step_loss / len(micros), step_lm / len(micros),
-                    step_aux / len(micros),
+                    step_aux / len(micros), step_z / len(micros),
                 )
                 total_tokens += step_tok
                 total_loss += loss
                 total_aux_loss += aux_loss
                 total_lm_loss += lm_loss
+                total_z_loss += z_loss
 
                 grad_norm = None
                 if train:
@@ -393,6 +403,7 @@ class preTrain:
                             "train/loss": loss.item(),
                             "train/lm_loss": lm_loss.item(),
                             "train/aux_loss": aux_loss.item(),
+                            "train/z_loss": z_loss.item(),
                             "train/grad_norm": (
                                 grad_norm.item()
                                 if grad_norm is not None
@@ -413,6 +424,7 @@ class preTrain:
             (total_loss / (step + 1)).item(),
             (total_aux_loss / (step + 1)).item(),
             (total_lm_loss / (step + 1)).item(),
+            (total_z_loss / (step + 1)).item(),
             total_tokens,
         )
 
@@ -429,7 +441,7 @@ class preTrain:
                     torch.cuda.reset_peak_memory_stats()
                     torch.cuda.synchronize()
                 start = time.perf_counter()
-                (epoch_loss, epoch_aux_loss, epoch_lm_loss, total_tokens) = self.run_epoch(
+                (epoch_loss, epoch_aux_loss, epoch_lm_loss, epoch_z_loss, total_tokens) = self.run_epoch(
                     loader=loader,
                     train=flag,
                 )
@@ -449,6 +461,7 @@ class preTrain:
                     f"Total Loss:     {epoch_loss:.4f}\n"
                     f"LM Loss:        {epoch_lm_loss:.4f}\n"
                     f"Aux Loss:       {epoch_aux_loss:.4f}\n"
+                    f"Z Loss:         {epoch_z_loss:.4f}\n"
                     f"Perplexity:     {perplexity:.2f}\n"
                     f"Avg Throughput: {tokens_per_second:,.0f} tok/s\n"
                     f"Time per Batch: {time_per_step:.3f}s\n"
@@ -461,6 +474,7 @@ class preTrain:
                     f"{prefix}/loss": epoch_loss,
                     f"{prefix}/lm_loss": epoch_lm_loss,
                     f"{prefix}/aux_loss": epoch_aux_loss,
+                    f"{prefix}/z_loss": epoch_z_loss,
                     f"{prefix}/perplexity": perplexity,
                     f"{prefix}/tok_s": tokens_per_second,
                     f"{prefix}/peak_mem_gb": peak_mem_gb,

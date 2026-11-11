@@ -247,7 +247,10 @@ class BatchedSwiGLUMoE(nn.Module):
 
     @torch.compiler.disable
     def forward(self, x):
-        scores = self.router(x).float().softmax(-1)
+        logits = self.router(x)
+        if self.training:
+            logits = logits + torch.randn_like(logits) * 0.1
+        scores = logits.float().softmax(-1)
         topk_scores, topk_ids = scores.topk(self.top_k, -1)
 
         flat_ids = topk_ids.reshape(-1)
@@ -272,9 +275,11 @@ class BatchedSwiGLUMoE(nn.Module):
         f = counts.detach().float() / flat_ids.numel()
         aux = self.num_experts * (f*P).sum()
 
+        z_loss = self.num_experts * (scores ** 2).sum(-1).mean()
+
         out = torch.zeros_like(x)
         out.index_add_(0, token_idx, h3 * flat_scores[order, None])
-        return (out, aux)
+        return (out, aux, z_loss)
 
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
@@ -304,8 +309,8 @@ class TransformerBlock(nn.Module):
         x = x + self.attn(self.attn_norm(x), block_mask, attention_mask, position_ids)
 
         B, T, D = x.shape
-        moe_out, aux = self.moe(self.moe_norm(x).view(B * T, D))
-        return x + moe_out.view(B, T, D), aux
+        moe_out, aux, z_loss = self.moe(self.moe_norm(x).view(B * T, D))
+        return x + moe_out.view(B, T, D), aux, z_loss
 
 
 class MoESLM(nn.Module):
@@ -379,11 +384,14 @@ class MoESLM(nn.Module):
 
         x = self.tok_emb(input_ids)
         aux_total = x.new_zeros(())
+        z_total = aux_total.detach().clone()
+
         for block in self.blocks:
-            x, block_aux = block(x, block_mask, padding_mask, position_ids)
-            aux_total = aux_total + block_aux
+            x, block_aux, block_z = block(x, block_mask, padding_mask, position_ids)
+            aux_total += block_aux
+            z_total +=  block_z
         x = self.norm(x)
-        return self.lm_head(x), aux_total
+        return self.lm_head(x), aux_total, z_total
 
 
 def compile_model(model: MoESLM, dynamic: bool = True, mode: str | None = None) -> MoESLM:
