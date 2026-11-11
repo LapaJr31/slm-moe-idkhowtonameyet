@@ -9,7 +9,6 @@ import torch.nn.functional as F
 
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
-from torch.utils.checkpoint import checkpoint_sequential
 
 from datasets import load_from_disk, Dataset
 
@@ -19,9 +18,7 @@ from rich.progress import (
     Progress,
     BarColumn,
     TextColumn,
-    TaskProgressColumn,
     MofNCompleteColumn,
-    TimeRemainingColumn,
 )
 from .model import MoESLM, compile_model
 
@@ -50,20 +47,20 @@ def chunked_cross_entropy(logits, targets, chunk=4096, ignore_index=-100):
 
 class preTrain:
     EPOCHS = 1
-    BATCH_SIZE = 16        # micro-batch
+    BATCH_SIZE = 8        # micro-batch
     GRAD_ACCUM = 16        # effective batch BATCH_SIZE * GRAD_ACCUM
     TIME_STEPS = 50        # how many optimizer steps to profile timing for
     AUX_COEF = 0.01       # load-balancing loss weight
     Z_COEF = 0.01         # router confidence penalty weight
-    LR_MUON = 0.04
-    LR_ADAMW = 6e-4
+    LR_MUON = 0.02
+    LR_ADAMW = 3e-4
     SEQLEN = 2048
-    CE_CHUNK = 8192       # positions per chunked-CE slice
+    CE_CHUNK = 8192
     SAVE_EVERY = 100
     LOG_EVERY = 50
     CHECKPOINT_DIR = Path("checkpoints")
 
-    def __init__(self, dataset_tokenized : Path, model : MoESLM, seed : int = 99, run_type: str = "dry_run"):
+    def __init__(self, dataset_tokenized: "Path | Dataset", model : MoESLM, seed : int = 99, run_type: str = "dry_run"):
         torch.manual_seed(seed)
 
         mlflow.set_experiment("moe-slm-pretrain")
@@ -84,10 +81,11 @@ class preTrain:
 
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.precision = torch.bfloat16
-        self.criterion = F.cross_entropy
 
         model = model.to(self.device)
-        model = compile_model(model = model,  mode = "default")
+        model.gradient_checkpointing_enable()
+
+        model = compile_model(model, strategy="whole")
 
         if isinstance(dataset_tokenized, Dataset):
             dataset = dataset_tokenized
@@ -129,7 +127,7 @@ class preTrain:
         )
         self.test_dl = self.create_dataloader(
             test_slice,
-            batch=512,
+            batch=self.BATCH_SIZE,   # 512 would OOM at 1B scale: logits alone are ~B*2047*50k
             num_workers=4,
             shuffle=False,
         )
@@ -472,6 +470,47 @@ class preTrain:
             total_tokens,
         )
 
+    def run_test(self):
+        best_path = self.CHECKPOINT_DIR / "best.pt"
+        if best_path.exists():
+                ckpt = torch.load(best_path, map_location=self.device, weights_only=False)
+                self.model.load_state_dict(ckpt["model"])
+                print(f"\n[test] loaded best checkpoint ({best_path})")
+
+        self.model.eval()
+        loader = self.test_dl
+        if len(loader) == 0:
+            print("[test] test split is empty, skipping")
+            return
+
+        total_lm = 0.0
+        n_batches = 0
+        with torch.no_grad():
+            for batch in loader:
+                batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
+                with torch.autocast("cuda", dtype=self.precision):
+                    logits, aux_loss, z_loss = self.model(input_ids=batch["input_ids"])
+                    lm_loss = chunked_cross_entropy(
+                        logits, batch["input_ids"], chunk=self.CE_CHUNK
+                    )
+                    total_lm += lm_loss.item()
+                    n_batches += 1
+
+        avg_lm = total_lm / n_batches
+        ppl = math.exp(avg_lm)
+        print(
+            f"\n{'=' * 50}\nTEST (held-out, best checkpoint)\n"
+            f"{'-' * 40}\n"
+            f"LM Loss:        {avg_lm:.4f}\n"
+            f"Perplexity:     {ppl:.2f}\n"
+            f"Batches:        {n_batches}\n"
+            f"{'=' * 50}"
+        )
+        mlflow.log_metrics({
+            "test/lm_loss": avg_lm,
+            "test/perplexity": ppl,
+        })
+
     def train(self):
         train_vals = {"Train": True, "Val": False}
         print(f"\n{'-' * 50}\nStarting training")
@@ -535,7 +574,9 @@ class preTrain:
                     else:
                         self.save_checkpoint("latest")
 
+        if self.start_epoch < self.EPOCHS:
+            self.run_test()
+
         mlflow.end_run()
 
 #todo
-# test

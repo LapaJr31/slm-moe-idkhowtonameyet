@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.attention.flex_attention import flex_attention, create_block_mask
+from torch.utils.checkpoint import checkpoint
 
 
 flex_attention = torch.compile(flex_attention)  # ty:ignore[invalid-assignment]
@@ -360,6 +361,11 @@ class MoESLM(nn.Module):
         if tie_embeddings:
             self.lm_head.weight = self.tok_emb.weight
 
+        self.gradient_checkpointing = False
+
+    def gradient_checkpointing_enable(self):
+        self.gradient_checkpointing = True
+
     def forward(self, input_ids, attention_mask=None):
         if attention_mask is not None and bool(attention_mask.all()):
             attention_mask = None
@@ -384,17 +390,26 @@ class MoESLM(nn.Module):
 
         x = self.tok_emb(input_ids)
         aux_total = x.new_zeros(())
-        z_total = aux_total.detach().clone()
+        z_total = x.new_zeros(())
 
+        use_ckpt = self.training and self.gradient_checkpointing and torch.is_grad_enabled()
         for block in self.blocks:
-            x, block_aux, block_z = block(x, block_mask, padding_mask, position_ids)
+            if use_ckpt:
+                x, block_aux, block_z = checkpoint(
+                    block, x, block_mask, padding_mask, position_ids,
+                    use_reentrant=False,
+                )
+            else:
+                x, block_aux, block_z = block(x, block_mask, padding_mask, position_ids)
             aux_total += block_aux
             z_total +=  block_z
         x = self.norm(x)
         return self.lm_head(x), aux_total, z_total
 
-
-def compile_model(model: MoESLM, dynamic: bool = True, mode: str | None = None) -> MoESLM:
+def compile_model(model: MoESLM, mode: str | None = "default", strategy: str = "whole") -> MoESLM:
+    # either whole model or per block of a model
+    if strategy == "whole":
+        return torch.compile(model, dynamic=True, mode=mode)
     for block in model.blocks:
-        block.compile(dynamic=dynamic, mode=mode)
+        block.compile(dynamic=True, mode=mode)
     return model

@@ -75,7 +75,7 @@ def main():
         d_ffn=4224,
         top_k=2,
     )
-    trainer = preTrain(ds, model, run_type="dry_run")
+    trainer = preTrain(ds, model, run_type="rehearsal_100m")
     if latest_ckpt.exists():
         trainer.load_checkpoint(latest_ckpt)
     trainer.train()
