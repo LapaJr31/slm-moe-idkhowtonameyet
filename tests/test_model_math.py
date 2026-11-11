@@ -49,11 +49,11 @@ def test_custom_op_matches_eager_reference(device):
         assert torch.allclose(ref, got, atol=1e-4), f"grad mismatch for {name}"
 
 
-@pytest.mark.skipif(DEVICE.type != "cuda", reason="flex backward unsupported on CPU")
 def test_custom_op_compiles_without_graph_breaks(device):
     """Whole-model compile must not emit graph breaks — the break-in-loop
-    bug that forced the custom-op rewrite."""
-    m = tiny_model().to(device)
+    bug that forced the custom-op rewrite. Uses the sdpa attention path so it
+    runs on CPU too (flex lacks CPU fake/backward kernels)."""
+    m = tiny_model(attn_implementation="sdpa").to(device)
     m.train()
     ids = random_batch(vocab=256)["input_ids"]
 
