@@ -1,3 +1,4 @@
+import itertools
 import math
 import time
 
@@ -10,7 +11,8 @@ from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 from torch.utils.checkpoint import checkpoint_sequential
 
-from datasets import load_from_disk
+from datasets import load_from_disk, Dataset
+
 
 from pathlib import Path
 from rich.progress import (
@@ -23,9 +25,19 @@ from rich.progress import (
 )
 from .model import MoESLM, compile_model
 
+
+def _fmt_hms(sec: float) -> str:
+    sec = int(sec)
+    h, rem = divmod(sec, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+
 class preTrain:
     EPOCHS = 1
-    BATCH_SIZE = 64
+    BATCH_SIZE = 8        # micro-batch
+    GRAD_ACCUM = 16        # effective batch 64
+    AUX_COEF = 0.05       # load-balancing loss weight
     LR_MUON = 0.02
     LR_ADAMW = 3e-4
     SEQLEN = 2048
@@ -46,6 +58,7 @@ class preTrain:
             "lr_muon": self.LR_MUON,
             "lr_adamw": self.LR_ADAMW,
             "seed": seed,
+            "aux_coef": self.AUX_COEF,
             **{f"model/{k}": v for k, v in model.config.items()},
             "model/param_count": sum(p.numel() for p in model.parameters()),
         })
@@ -57,7 +70,11 @@ class preTrain:
         model = model.to(self.device)
         model = compile_model(model = model,  mode = "default")
 
-        dataset = load_from_disk(dataset_tokenized).with_format("torch")
+        if isinstance(dataset_tokenized, Dataset):
+            dataset = dataset_tokenized
+        else:
+            dataset = load_from_disk(dataset_tokenized)
+        dataset = dataset.with_format("torch")
         n = len(dataset)
         train_slice = dataset.select(range(int(n * 0.90)))
         val_slice = dataset.select(range(int(n * 0.90), int(n * 0.95)))
@@ -98,7 +115,7 @@ class preTrain:
             shuffle=False,
         )
 
-        total_steps = len(self.train_dl) * self.EPOCHS
+        total_steps = math.ceil(len(self.train_dl) / self.GRAD_ACCUM) * self.EPOCHS
         self.schedule_adamw = self.make_wsd_scheduler(
             optimizer= self.adamw,
             total_steps=total_steps,
@@ -114,6 +131,7 @@ class preTrain:
         self.optim_steps_val = len(self.val_dl)
 
         self.tokens_seen = 0
+        self.total_tokens = 0
         self.start_epoch = 0
         self.best_val_loss = float("inf")
         self.CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
@@ -227,16 +245,16 @@ class preTrain:
 
         with Progress(
             TextColumn("[bold blue]{task.description}"),
-            BarColumn(),
+            BarColumn(bar_width=30),
             MofNCompleteColumn(),
             TextColumn("[green]{task.fields[tok_s]:,.0f} tok/s"),
             TextColumn("[yellow]Loss: {task.fields[loss]:.4f}"),
-            TextColumn("LM: {task.fields[lm_loss]:.4f}"),
-            TextColumn("Aux: {task.fields[aux_loss]:.4f}"),
-            TextColumn("Grad: {task.fields[grad_norm]:.3f}"),
-            TextColumn("Mem: {task.fields[gpu_mem_gb]:.2f}GB"),
-            TimeRemainingColumn(),
-            expand=True,
+            TextColumn("[yellow]LM: {task.fields[lm_loss]:.4f}"),
+            TextColumn("[yellow]Aux: {task.fields[aux_loss]:.4f}"),
+            TextColumn("[yellow]Grad: {task.fields[grad_norm]:.3f}"),
+            TextColumn("[yellow]Mem: {task.fields[gpu_mem_gb]:.2f}GB"),
+            TextColumn("[cyan]{task.fields[elapsed]}[/]:[magenta]{task.fields[eta]}[/]"),
+            expand=False,
             refresh_per_second=2,
         ) as progress:
 
@@ -249,66 +267,100 @@ class preTrain:
                 aux_loss=0.0,
                 grad_norm=0.0,
                 gpu_mem_gb=0.0,
+                elapsed="0:00",
+                eta="-",
             )
 
             start = time.perf_counter()
 
-            for step, batch in enumerate(loader):
-                batch = {
-                    k: v.to(self.device, non_blocking=True)
-                    for k, v in batch.items()
-                }
+            accum = self.GRAD_ACCUM if train else 1
+            n_steps = math.ceil(len(loader) / accum)
+            progress.update(task, total=n_steps)
+
+            it = iter(loader)
+            for step in range(n_steps):
+                micros = list(itertools.islice(it, accum))
+                if not micros:
+                    break
 
                 should_log = (
                     (step + 1) % self.LOG_EVERY == 0
-                    or step + 1 == len(loader)
+                    or step + 1 == n_steps
                 )
                 if train:
                     self.adamw.zero_grad(set_to_none=True)
                     self.muon.zero_grad(set_to_none=True)
 
-                with torch.set_grad_enabled(train):
-                    with torch.autocast("cuda", dtype=self.precision):
-                        logits, aux_loss = self.model(
-                            input_ids=batch["input_ids"]
-                        )
+                step_loss = torch.zeros((), device=self.device)
+                step_aux = torch.zeros_like(step_loss)
+                step_lm = torch.zeros_like(step_loss)
+                step_tok = 0
 
-                    lm_loss = self.criterion(
-                        logits[:, :-1].float().reshape(-1, logits.size(-1)),
-                        batch["input_ids"][:, 1:].reshape(-1),
-                    )
+                for batch in micros:
+                    batch = {
+                        k: v.to(self.device, non_blocking=True)
+                        for k, v in batch.items()
+                    }
 
-                    loss = lm_loss + 0.01 * aux_loss.float()
-                    grad_norm = None
-                    if train:
-                        loss.backward()
-                        if should_log:
-                            grad_norm = torch.nn.utils.clip_grad_norm_(
-                                self.model.parameters(),
-                                max_norm=float("inf"),
+                    with torch.set_grad_enabled(train):
+                        with torch.autocast("cuda", dtype=self.precision):
+                            logits, aux_loss = self.model(
+                                input_ids=batch["input_ids"]
                             )
 
-                        self.adamw.step()
-                        self.muon.step()
+                        lm_loss = self.criterion(
+                            logits[:, :-1].float().reshape(-1, logits.size(-1)),
+                            batch["input_ids"][:, 1:].reshape(-1),
+                        )
 
-                        self.schedule_adamw.step()
-                        self.schedule_muon.step()
+                        loss = lm_loss + self.AUX_COEF * aux_loss.float()
+                        if train:
+                            (loss / len(micros)).backward()
 
+                    if train:
                         self.total_tokens += batch["input_ids"].numel()
+                    step_tok += batch["input_ids"].numel()
+                    step_loss += loss.detach()
+                    step_aux += aux_loss.detach()
+                    step_lm += lm_loss.detach()
 
-                        if (step + 1) % self.SAVE_EVERY == 0 or step + 1 == len(loader):
-                            self.save_checkpoint("latest")
+                loss, lm_loss, aux_loss = (
+                    step_loss / len(micros), step_lm / len(micros),
+                    step_aux / len(micros),
+                )
+                total_tokens += step_tok
+                total_loss += loss
+                total_aux_loss += aux_loss
+                total_lm_loss += lm_loss
 
-                total_tokens += batch["input_ids"].numel()
+                grad_norm = None
+                if train:
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(),
+                        max_norm=float("inf"),
+                    )
 
-                total_loss += loss.detach()
-                total_aux_loss += aux_loss.detach()
-                total_lm_loss += lm_loss.detach()
+                    self.adamw.step()
+                    self.muon.step()
+
+                    self.schedule_adamw.step()
+                    self.schedule_muon.step()
+
+                    if (step + 1) % self.SAVE_EVERY == 0 or step + 1 == n_steps:
+                        self.save_checkpoint("latest")
+
+                elapsed = time.perf_counter() - start
+                eta = elapsed / (step + 1) * (n_steps - step - 1)
+                progress.update(
+                    task,
+                    completed=step + 1,
+                    elapsed=_fmt_hms(elapsed),
+                    eta=_fmt_hms(eta) if eta > 0 else "0:00",
+                )
 
                 if should_log:
                     if self.device == "cuda":
                         torch.cuda.synchronize()
-                    elapsed = time.perf_counter() - start
                     tok_s = total_tokens / elapsed
                     gpu_mem_gb = (
                         torch.cuda.memory_allocated() / 1024**3
@@ -321,7 +373,6 @@ class preTrain:
 
                     progress.update(
                         task,
-                        completed=step + 1,
                         tok_s=tok_s,
                         loss=loss.item(),
                         lm_loss=lm_loss.item(),
@@ -359,9 +410,9 @@ class preTrain:
                         }, step=self.total_tokens + total_tokens)
 
         return (
-            (total_loss / len(loader)).item(),
-            (total_aux_loss / len(loader)).item(),
-            (total_lm_loss / len(loader)).item(),
+            (total_loss / (step + 1)).item(),
+            (total_aux_loss / (step + 1)).item(),
+            (total_lm_loss / (step + 1)).item(),
             total_tokens,
         )
 

@@ -14,31 +14,43 @@ SEQLEN = preTrain.SEQLEN
 
 
 def main():
-    mix = Dataset_Mixed(
-        testing=True,
-        total_tokens_b=1.0,
-        tokenizer="HuggingFaceTB/SmolLM2-1.7B",
-    )
+    from datasets import load_from_disk
 
     out = "tokenizers/smol-data-1b-50k"
-    if os.path.exists(os.path.join(out, "tokenizer.json")):
-        print(f"tokenizer already exists at {out}, loading it")
-    else:
-        bpe = train_bpe_on_mix(
-            mix,
-            vocab_size=VOCAB_SIZE,
-            tokens_b=1.0,
-            cache_name="smol-data-1b",
-        )
-        bpe.save_pretrained(out)
+    ds_path = Path("dataset/")
+    have_tokenizer = os.path.exists(os.path.join(out, "tokenizer.json"))
+    have_dataset = ds_path.exists()
 
-    ds = Path("dataset/")
-    if ds.exists():
-        print("Dataset exists")
+    if have_tokenizer and have_dataset:
+        print(f"tokenizer already exists at {out}, loading it")
+        print(f"loading dataset from {ds_path}")
+        ds = load_from_disk(ds_path)
     else:
-        tok = AutoTokenizer.from_pretrained(out)
-        ds = mix.tokenize(mix.dataset, tok)
-        print(f"tokenized dataset ready: {len(ds):,} x {SEQLEN}-token rows")
+        mix = Dataset_Mixed(
+            testing=True,
+            total_tokens_b=1.0,
+            tokenizer="HuggingFaceTB/SmolLM2-1.7B",
+        )
+
+        if have_tokenizer:
+            print(f"tokenizer already exists at {out}, loading it")
+            tok = AutoTokenizer.from_pretrained(out)
+        else:
+            bpe = train_bpe_on_mix(
+                mix,
+                vocab_size=VOCAB_SIZE,
+                tokens_b=1.0,
+                cache_name="smol-data-1b",
+            )
+            bpe.save_pretrained(out)
+            tok = AutoTokenizer.from_pretrained(out)
+
+        if have_dataset:
+            print(f"loading dataset from {ds_path}")
+            ds = load_from_disk(ds_path)
+        else:
+            ds = mix.tokenize(mix.dataset, tok)
+            print(f"tokenized dataset ready: {len(ds):,} x {SEQLEN}-token rows")
 
     latest_ckpt = Path("checkpoints/latest.pt")
     if latest_ckpt.exists():

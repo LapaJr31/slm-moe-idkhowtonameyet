@@ -10,6 +10,13 @@ wheels/
 .venv
 .cache/
 tokenizers/smol-data-1b-50k/
-dataset/
+dataset/*
 test.py
 dataset.tar.zst
+thinklapka.tail16a3f8.ts.net.crt
+thinklapka.tail16a3f8.ts.net.key
+tokenizer.tar.zst
+mlflow_serve.sh
+mlflow.db
+out.log
+checkpoint.tar.zst

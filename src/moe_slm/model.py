@@ -236,7 +236,8 @@ class GQAAttention(nn.Module):
 class BatchedSwiGLUMoE(nn.Module):
     def __init__(self, num_experts: int, d_ffn: int, d_model: int = 1024, top_k: int = 2):
         super().__init__()
-        hidden_dim = int(2 * d_ffn / 3)
+        # 16-byte stride alignment requirement
+        hidden_dim = -(-2 * d_ffn // 3 // 8) * 8
         self.top_k, self.num_experts, self.hidden_dim = top_k, num_experts, hidden_dim
         self.router = nn.Linear(d_model, num_experts, bias=False)
         self.w13 = nn.Parameter(torch.empty(num_experts, 2 * hidden_dim, d_model))
