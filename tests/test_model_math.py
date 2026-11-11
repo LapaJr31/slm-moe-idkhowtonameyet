@@ -35,8 +35,8 @@ def test_custom_op_matches_eager_reference(device):
         t.grad = None
 
     # through the custom op
-    from moe_slm.model import batched_swiglu
-    out_op, aux_op, z_op = batched_swiglu(x, logits, w13, w2, top_k)
+    import moe_slm.model as M
+    out_op, aux_op, z_op = torch.ops.moe_slm.batched_swiglu(x, logits, w13, w2, top_k)
     (out_op.sum() + 0.01 * aux_op + 0.01 * z_op).backward()
 
     assert torch.allclose(out_ref, out_op, atol=1e-5)
