@@ -45,6 +45,37 @@ def chunked_cross_entropy(logits, targets, chunk=4096, ignore_index=-100):
     return total / n_valid
 
 
+class ExpertMuon(optim.Muon):
+    def __init__(self, params, **kwargs):
+        self.sources = list(params)
+        self.slices = [
+            [torch.nn.Parameter(part) for part in p.unbind(0)] if p.ndim == 3 else [p]
+            for p in self.sources
+        ]
+        super().__init__([part for parts in self.slices for part in parts], **kwargs)
+
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+        for source, parts in zip(self.sources, self.slices):
+            if source.ndim == 3:
+                for i, part in enumerate(parts):
+                    part.grad = None if source.grad is None else source.grad[i]
+        result = super().step()
+        return loss if closure is not None else result
+
+    def zero_grad(self, set_to_none=True):
+        super().zero_grad(set_to_none=set_to_none)
+        for source in self.sources:
+            if source.ndim == 3 and source.grad is not None:
+                if set_to_none:
+                    source.grad = None
+                else:
+                    source.grad.zero_()
+
+
 class preTrain:
     EPOCHS = 1
     BATCH_SIZE = 16        # micro-batch
@@ -103,7 +134,12 @@ class preTrain:
         adamw_params = self.get_adamw_params(model, muon_params)
 
 
-        self.muon = optim.Muon(
+        muon_ids = {id(p) for p in muon_params}
+        for name, p in model.named_parameters():
+            if p.requires_grad:
+                print(f"Optimizer {'Muon' if id(p) in muon_ids else 'AdamW'}: {name} {tuple(p.shape)}")
+
+        self.muon = ExpertMuon(
             muon_params,
             lr=self.LR_MUON,
             momentum=0.95,
@@ -189,11 +225,12 @@ class preTrain:
             p for name, p in model.named_parameters()
             if (
                 p.requires_grad
-                and p.ndim == 2
+                and (p.ndim == 2 or (p.ndim == 3 and name.rsplit(".", 1)[-1] in ("w13", "w2")))
                 and not any(
                     excluded in name.lower()
                     for excluded in (
                         "embed",
+                        "tok_emb",
                         "lm_head",
                         "router",
                     )

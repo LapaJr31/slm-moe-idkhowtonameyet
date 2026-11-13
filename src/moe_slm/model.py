@@ -1,4 +1,5 @@
 import hashlib
+from fractions import Fraction
 
 import torch
 import torch.nn as nn
@@ -235,52 +236,81 @@ class GQAAttention(nn.Module):
         return self.o_proj(y)
 
 class BatchedSwiGLUMoE(nn.Module):
-    def __init__(self, num_experts: int, d_ffn: int, d_model: int = 1024, top_k: int = 2):
+    def __init__(
+        self,
+        num_experts: int,
+        d_ffn: int,
+        d_model: int = 1024,
+        top_k: int = 2,
+        capacity_factor: float = 1.25,
+        n_layers: int = 1,
+    ):
         super().__init__()
-        # 16-byte stride alignment requirement
-        hidden_dim = -(-2 * d_ffn // 3 // 8) * 8
+        if not 1 <= top_k <= num_experts or capacity_factor <= 0 or n_layers < 1:
+            raise ValueError("Invalid routing capacity, top_k, or layer count")
+        hidden_dim = ((2 * d_ffn + 23) // 24) * 8
+
         self.top_k, self.num_experts, self.hidden_dim = top_k, num_experts, hidden_dim
+        self.capacity_factor = capacity_factor
         self.router = nn.Linear(d_model, num_experts, bias=False)
         self.w13 = nn.Parameter(torch.empty(num_experts, 2 * hidden_dim, d_model))
-        self.w2  = nn.Parameter(torch.empty(num_experts, d_model, hidden_dim))
-        for p in (self.w13, self.w2):
-            nn.init.kaiming_uniform_(p, a=5**0.5)
+        self.w2 = nn.Parameter(torch.empty(num_experts, d_model, hidden_dim))
 
-    @torch.compiler.disable
-    def forward(self, x):
-        logits = self.router(x)
-        if self.training:
-            logits = logits + torch.randn_like(logits) * 0.1
-        scores = logits.float().softmax(-1)
-        topk_scores, topk_ids = scores.topk(self.top_k, -1)
+        nn.init.normal_(self.router.weight, std=0.02)
+        nn.init.normal_(self.w13, std=0.02)
+        nn.init.normal_(self.w2, std=0.02 / (2 * n_layers) ** 0.5)
 
-        flat_ids = topk_ids.reshape(-1)
-        flat_scores = topk_scores.reshape(-1)
-        order = flat_ids.argsort()
-        expert_sorted = flat_ids[order]
-        token_idx = order // self.top_k
-        x_sorted = x[token_idx]
+        self.register_buffer("drop_rate", torch.zeros(()), persistent=False)
 
-        counts = torch.bincount(expert_sorted, minlength=self.num_experts)
-        offs = counts.cumsum(0, dtype=torch.int32)
+    @property
+    def capacity_factor(self) -> float:
+        return self._capacity_factor
 
-        #gemm 1
-        h13 = torch._grouped_mm(x_sorted, self.w13.transpose(-1, -2), offs=offs)
-        gate, up = h13.split(self.hidden_dim, dim=-1)
-        h2 = F.silu(gate) * up
+    @capacity_factor.setter
+    def capacity_factor(self, value: float) -> None:
+        if value <= 0:
+            raise ValueError("capacity_factor must be positive")
+        factor = Fraction(str(value))
+        self._capacity_factor = value
+        self._capacity_numerator = factor.numerator
+        self._capacity_divisor = factor.denominator
 
-        # gemm 2
-        h3 = torch._grouped_mm(h2, self.w2.transpose(-1, -2), offs=offs)
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        N, D = x.shape
+        E, K = self.num_experts, self.top_k
+        R = N * K
 
-        P = scores.mean(dim=0)
-        f = counts.detach().float() / flat_ids.numel()
-        aux = self.num_experts * (f*P).sum()
+        numerator, divisor = self._capacity_numerator, self._capacity_divisor
+        denominator = E * divisor
+        C = (R * numerator + denominator - 1) // denominator
 
-        z_loss = self.num_experts * (scores ** 2).sum(-1).mean()
+        logits = self.router(x).float()
+        scores = logits.softmax(-1)
+        route_scores, route_experts = scores.topk(K, -1)
+        z_loss = logits.logsumexp(-1).square().mean()
 
-        out = torch.zeros_like(x)
-        out.index_add_(0, token_idx, h3 * flat_scores[order, None])
-        return (out, aux, z_loss)
+        expert_ids = route_experts.reshape(-1)
+        counts = torch.zeros(E, device=x.device, dtype=torch.long).scatter_add(
+            0, expert_ids, torch.ones_like(expert_ids)
+        )
+        aux = E * ((counts.float() / R) * scores.mean(0)).sum()
+        perm = expert_ids.argsort(stable=True)
+        sorted_experts = expert_ids[perm]
+        offsets = counts.cumsum(0) - counts
+        slots = torch.arange(R, device=x.device) - offsets[sorted_experts]
+        keep = slots < C
+        self.drop_rate.copy_((~keep).float().mean().detach())
+        token_ids = perm // K
+        destinations = sorted_experts * C + slots.clamp(max=C - 1)
+        dispatched = x.new_zeros(E * C, D).index_add(
+            0, destinations, x[token_ids] * keep[:, None].to(x.dtype)
+        ).view(E, C, D)
+        gate, up = torch.bmm(dispatched, self.w13.transpose(1, 2)).chunk(2, -1)
+        values = torch.bmm(F.silu(gate) * up, self.w2.transpose(1, 2))
+        weights = route_scores.reshape(-1)[perm] * keep
+        routed = values.reshape(E * C, D)[destinations] * weights[:, None].to(values.dtype)
+        output = torch.zeros_like(x).index_add(0, token_ids, routed.to(x.dtype))
+        return output, aux, z_loss
 
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
@@ -298,13 +328,14 @@ class RMSNorm(nn.Module):
 class TransformerBlock(nn.Module):
     def __init__(self, d_model: int, n_q_heads: int, n_kv_heads: int,
                  num_experts: int, d_ffn: int, top_k: int,
-                 max_seq_len: int = 8192, attn_implementation: str = "flex"):
+                 max_seq_len: int = 8192, attn_implementation: str = "flex",
+                 n_layers: int = 1):
         super().__init__()
         self.attn_norm = RMSNorm(d_model)
         self.attn = GQAAttention(d_model, n_q_heads, n_kv_heads,
                                  max_seq_len, attn_implementation)
         self.moe_norm = RMSNorm(d_model)
-        self.moe = BatchedSwiGLUMoE(num_experts, d_ffn, d_model, top_k)
+        self.moe = BatchedSwiGLUMoE(num_experts, d_ffn, d_model, top_k, n_layers=n_layers)
 
     def forward(self, x, block_mask, attention_mask, position_ids):
         x = x + self.attn(self.attn_norm(x), block_mask, attention_mask, position_ids)
@@ -353,7 +384,7 @@ class MoESLM(nn.Module):
         self.blocks = nn.ModuleList([
             TransformerBlock(d_model, n_q_heads, n_kv_heads,
                              num_experts, d_ffn, top_k,
-                             max_seq_len, attn_implementation)
+                             max_seq_len, attn_implementation, n_layers)
             for _ in range(n_layers)
         ])
         self.norm = RMSNorm(d_model)

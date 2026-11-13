@@ -19,7 +19,7 @@ def reference_moe(moe, x):
         output = output + value * weight
     fractions = F.one_hot(ids, moe.num_experts).float().mean(dim=(0, 1))
     aux = moe.num_experts * (fractions * scores.mean(0)).sum()
-    z = moe.num_experts * scores.square().sum(-1).mean()
+    z = moe.router(x).float().logsumexp(-1).square().mean()
     return output, aux, z
 
 
@@ -31,7 +31,7 @@ def test_moe_matches_per_expert_reference(device, top_k, collapsed):
     Collapsed routing leaves experts unused when top_k < num_experts.
     """
     torch.manual_seed(0)
-    moe = BatchedSwiGLUMoE(4, 48, d_model=32, top_k=top_k).to(device).eval()
+    moe = BatchedSwiGLUMoE(4, 48, d_model=32, top_k=top_k, capacity_factor=8).to(device).eval()
     x = torch.randn(6, 32, device=device)
     if collapsed:
         x = x.abs() + 1
@@ -55,8 +55,8 @@ def test_moe_matches_per_expert_reference(device, top_k, collapsed):
         torch.testing.assert_close(got, ref, atol=1e-6, rtol=1e-4)
 
 
-def test_compile_matches_eager_with_moe_graph_breaks(device):
-    """Compilation may break around eager MoE, but must preserve training math."""
+def test_compile_matches_eager_fullgraph(device):
+    """Compilation preserves training math in a single graph."""
     torch.manual_seed(4)
     m = tiny_model(attn_implementation="sdpa").to(device).eval()
     ids = random_batch(vocab=256)["input_ids"]
@@ -64,7 +64,7 @@ def test_compile_matches_eager_with_moe_graph_breaks(device):
     sum(t.float().square().mean() for t in expected).backward()
     expected_grads = {n: p.grad.clone() for n, p in m.named_parameters()}
     m.zero_grad(set_to_none=True)
-    compiled = torch.compile(m, dynamic=True)
+    compiled = torch.compile(m, dynamic=True, fullgraph=True)
     actual = compiled(ids)
     sum(t.float().square().mean() for t in actual).backward()
     for ref, got in zip(expected, actual):
@@ -81,24 +81,20 @@ def test_aux_uniform_vs_collapsed_closed_form(device):
         moe.router.weight.zero_()
         _, aux, z = moe(x)
         torch.testing.assert_close(aux, aux.new_tensor(1.0))
-        torch.testing.assert_close(z, z.new_tensor(1.0))
+        torch.testing.assert_close(z, z.new_tensor(4.0).log().square())
         moe.router.weight[0].fill_(100.0)
         _, aux, z = moe(x)
         torch.testing.assert_close(aux, aux.new_tensor(2.0))
-        torch.testing.assert_close(z, z.new_tensor(4.0))
+        torch.testing.assert_close(z, z.new_tensor(800.0 ** 2))
 
 
-def test_z_loss_minimum_at_uniform(device):
-    """z = E * mean(sum_i p_i^2); uniform p=1/E gives E * E*(1/E^2) = 1 per layer."""
+def test_z_loss_zero_logits(device):
     m = tiny_model(num_experts=4, attn_implementation="sdpa")
-    m.eval()
     with torch.no_grad():
         for blk in m.blocks:
             blk.moe.router.weight.zero_()
-    ids = random_batch(vocab=256)["input_ids"]
-    with torch.no_grad():  # no backward needed
-        _, _, z = m(ids)
-    assert abs(z.item() - m.config["n_layers"]) < 0.15
+        _, _, z = m(random_batch(vocab=256)["input_ids"])
+    torch.testing.assert_close(z, z.new_tensor(4.0).log().square() * m.config["n_layers"])
 
 
 # ---------------------------------------------------------------- checkpointing
@@ -121,7 +117,6 @@ def test_checkpointing_produces_identical_gradients(device):
         else:
             model.gradient_checkpointing = False
         model.train()
-        # Replay routing jitter for both runs; checkpointing must replay it too.
         torch.manual_seed(123)
         logits, aux, z = model(ids)
         loss = F.cross_entropy(
@@ -158,7 +153,7 @@ def test_checkpointing_disabled_at_eval(device):
 
 @pytest.mark.parametrize("d_ffn", [48, 100, 4224])
 def test_hidden_dim_alignment(d_ffn):
-    """hidden_dim must be a multiple of 8 — grouped_mm's 16-byte stride rule."""
+    """The SwiGLU width rounds up to a multiple of eight."""
     hidden = BatchedSwiGLUMoE(2, d_ffn, d_model=8).hidden_dim
     assert hidden % 8 == 0
     assert hidden >= 2 * d_ffn / 3

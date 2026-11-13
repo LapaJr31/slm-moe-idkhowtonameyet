@@ -92,7 +92,7 @@ def test_grad_accum_scaling_matches_single_batch():
     targets = [b.roll(-1, dims=-1) for b in batches]
 
     # accumulate 4 micro-batches (CE only, aux/z deliberately excluded)
-    m1.eval()  # Gradients remain enabled; disable stochastic router jitter.
+    m1.eval()
     for b, t in zip(batches, targets):
         logits, aux, z = m1(b)
         loss = F.cross_entropy(
