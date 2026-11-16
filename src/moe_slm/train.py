@@ -87,7 +87,7 @@ class preTrain:
     LR_MUON = 0.02
     LR_ADAMW = 3e-4
     SEQLEN = 2048
-    CE_CHUNK = 4096
+    CE_CHUNK = 8192
     SAVE_EVERY = 100
     LOG_EVERY = 50
     CHECKPOINT_DIR = Path("checkpoints")
@@ -101,6 +101,8 @@ class preTrain:
         mlflow.log_params({
             "epochs": self.EPOCHS,
             "batch_size": self.BATCH_SIZE,
+            "grad_accum": self.GRAD_ACCUM,
+            "ce_chunk": self.CE_CHUNK,
             "seqlen": self.SEQLEN,
             "lr_muon": self.LR_MUON,
             "lr_adamw": self.LR_ADAMW,
@@ -322,11 +324,15 @@ class preTrain:
         self,
         loader,
         train=True,
+        benchmark_steps=0,
+        benchmark_warmup=5,
     ):
         self.model.train(train)
 
         if len(loader) == 0:
             raise ValueError("DataLoader is empty")
+        if benchmark_steps and (not train or not 0 <= benchmark_warmup < benchmark_steps):
+            raise ValueError("Benchmark requires training steps after warmup")
 
         total_loss = torch.zeros((), device=self.device)
         total_aux_loss = torch.zeros_like(total_loss)
@@ -367,20 +373,30 @@ class preTrain:
 
             accum = self.GRAD_ACCUM if train else 1
             n_steps = math.ceil(len(loader) / accum)
+            if benchmark_steps:
+                if n_steps < benchmark_steps:
+                    raise ValueError("Not enough batches for the benchmark")
+                n_steps = benchmark_steps
+            benchmark_tokens = 0
             progress.update(task, total=n_steps)
 
             it = iter(loader)
             for step in range(n_steps):
+                if benchmark_steps and step == benchmark_warmup:
+                    if self.device == "cuda":
+                        torch.cuda.synchronize()
+                        torch.cuda.reset_peak_memory_stats()
+                    benchmark_start = time.perf_counter()
                 micros = list(itertools.islice(it, accum))
                 if not micros:
                     break
 
-                should_log = (
+                should_log = not benchmark_steps and (
                     (step + 1) % self.LOG_EVERY == 0
                     or step + 1 == n_steps
                 )
 
-                if train and step + 1 == self.TIME_STEPS:
+                if train and not benchmark_steps and step + 1 == self.TIME_STEPS:
                     t = self.timing
                     total = t["bwd"] + t["opt"]
                     print(
@@ -400,7 +416,7 @@ class preTrain:
                 step_tok = 0
 
                 # skip the first few steps: they absorb torch.compile recompiles
-                profile = train and 5 <= step < self.TIME_STEPS
+                profile = train and not benchmark_steps and 5 <= step < self.TIME_STEPS
                 for batch in micros:
                     batch = {
                         k: v.to(self.device, non_blocking=True)
@@ -443,6 +459,8 @@ class preTrain:
                     step_aux / len(micros), step_z / len(micros),
                 )
                 total_tokens += step_tok
+                if benchmark_steps and step >= benchmark_warmup:
+                    benchmark_tokens += step_tok
                 total_loss += loss
                 total_aux_loss += aux_loss
                 total_lm_loss += lm_loss
@@ -467,7 +485,7 @@ class preTrain:
                     if profile:
                         self.timing["opt"] += time.perf_counter() - t2
 
-                    if (step + 1) % self.SAVE_EVERY == 0 or step + 1 == n_steps:
+                    if not benchmark_steps and ((step + 1) % self.SAVE_EVERY == 0 or step + 1 == n_steps):
                         self.save_checkpoint("latest")
 
                 elapsed = time.perf_counter() - start
@@ -530,6 +548,18 @@ class preTrain:
                             "val/running_loss": (total_loss / (step + 1)).item(),
                             "val/running_lm_loss": (total_lm_loss / (step + 1)).item(),
                         }, step=self.total_tokens + total_tokens)
+
+        if benchmark_steps:
+            if self.device == "cuda":
+                torch.cuda.synchronize()
+            seconds = time.perf_counter() - benchmark_start
+            peak = torch.cuda.max_memory_allocated() / 1024**3 if self.device == "cuda" else 0.0
+            print(
+                f"[benchmark] batch={self.BATCH_SIZE} accum={accum} "
+                f"ce_chunk={self.CE_CHUNK} timed_steps={n_steps - benchmark_warmup} "
+                f"tokens={benchmark_tokens:,} seconds={seconds:.3f} "
+                f"tok/s={benchmark_tokens / seconds:,.0f} peak_allocated={peak:.2f} GiB"
+            )
 
         return (
             (total_loss / (step + 1)).item(),

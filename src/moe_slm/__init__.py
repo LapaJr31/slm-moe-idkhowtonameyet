@@ -1,4 +1,5 @@
 import os
+import argparse
 
 from pathlib import Path
 
@@ -16,6 +17,14 @@ SUBSAMPLE_TOKENS = False
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--benchmark-batch-size", type=int, choices=(16, 32, 64))
+    args = parser.parse_args()
+    if args.benchmark_batch_size is not None:
+        preTrain.BATCH_SIZE = args.benchmark_batch_size
+        preTrain.GRAD_ACCUM = 64 // args.benchmark_batch_size
+
     out = "tokenizers/smol-data-1b-50k"
     ds_path = Path("dataset/")
     have_tokenizer = os.path.exists(os.path.join(out, "tokenizer.json"))
@@ -76,7 +85,14 @@ def main():
         top_k=2,
         attn_implementation="flex",
     )
-    trainer = preTrain(ds, model, run_type="benchmarking_CE")
+    trainer = preTrain(ds, model, run_type="benchmark_batch" if args.benchmark_batch_size else "benchmarking_CE")
     if latest_ckpt.exists():
         trainer.load_checkpoint(latest_ckpt)
-    trainer.train()
+    if args.benchmark_batch_size:
+        try:
+            trainer.run_epoch(trainer.train_dl, benchmark_steps=15)
+        finally:
+            import mlflow
+            mlflow.end_run()
+    else:
+        trainer.train()

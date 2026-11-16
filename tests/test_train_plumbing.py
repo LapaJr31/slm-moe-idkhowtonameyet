@@ -118,7 +118,8 @@ def test_grad_accum_scaling_matches_single_batch():
 
 
 @pytest.mark.slow
-def test_training_smoke_saves_checkpoint(tmp_path, monkeypatch):
+@pytest.mark.parametrize("benchmark", [False, True])
+def test_training_smoke_saves_checkpoint(tmp_path, monkeypatch, capsys, benchmark):
     """Exercise the trainer, optimizers, token accounting and checkpoint writes."""
     from moe_slm.train import preTrain
     from datasets import Dataset as HFDataset
@@ -160,6 +161,18 @@ def test_training_smoke_saves_checkpoint(tmp_path, monkeypatch):
 
     # shrink val slice: train.py splits 90/5/5 — with 64 rows val has 3 rows,
     # 1 val batch. Fine.
+    if benchmark:
+        # Even SAVE_EVERY=1 must not write during a disposable benchmark.
+        trainer.SAVE_EVERY = 1
+        trainer.run_epoch(trainer.train_dl, benchmark_steps=6, benchmark_warmup=2)
+        assert trainer.total_tokens == 6 * 4 * 2 * seqlen
+        assert not list(trainer.CHECKPOINT_DIR.glob("*.pt"))
+        assert len(norm_calls) == 0
+        output = capsys.readouterr().out
+        assert "timed_steps=4 tokens=2,048" in output
+        assert "tok/s=" in output
+        return
+
     trainer.train()
 
     assert math.isfinite(trainer.best_val_loss)
