@@ -124,6 +124,7 @@ class preTrain:
 
         print(f"Compiling model")
         model = compile_model(model, mode="max-autotune", strategy="whole")
+        torch.cuda.synchronize()
         print(f"Finished compilation")
 
         if isinstance(dataset_tokenized, Dataset):

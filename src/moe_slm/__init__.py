@@ -19,7 +19,7 @@ SUBSAMPLE_TOKENS = False
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--benchmark-batch-size", type=int, choices=(16, 32, 64))
+        "--benchmark-batch-size", type=int)
     args = parser.parse_args()
     if args.benchmark_batch_size is not None:
         preTrain.BATCH_SIZE = args.benchmark_batch_size
