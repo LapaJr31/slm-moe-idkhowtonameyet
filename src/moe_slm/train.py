@@ -87,7 +87,7 @@ class preTrain:
     LR_MUON = 0.02
     LR_ADAMW = 3e-4
     SEQLEN = 2048
-    CE_CHUNK = 16384
+    CE_CHUNK = 4096
     SAVE_EVERY = 100
     LOG_EVERY = 50
     CHECKPOINT_DIR = Path("checkpoints")
