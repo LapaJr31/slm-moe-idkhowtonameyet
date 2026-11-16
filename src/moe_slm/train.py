@@ -11,6 +11,7 @@ from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 
 from datasets import load_from_disk, Dataset
+from mlflow.data.huggingface_dataset import from_huggingface
 
 
 from pathlib import Path
@@ -130,9 +131,36 @@ class preTrain:
         val_slice = dataset.select(range(int(n * 0.90), int(n * 0.95)))
         test_slice = dataset.select(range(int(n * 0.95), n))
 
+        source = (
+            str(Path(dataset_tokenized).resolve())
+            if not isinstance(dataset_tokenized, Dataset)
+            else None
+        )
+
+        for split, context in [
+            (train_slice, "training"),
+            (val_slice, "validation"),
+            (test_slice, "testing"),
+        ]:
+            tracked = from_huggingface(
+                split,
+                source=source,
+                name=f"moe-slm-{context}",
+            )
+            mlflow.log_input(tracked, context=context)
+
+
+        mlflow.log_dict(
+            {
+                "sources": ["lapkaaaa/smol-10B"],
+                "revision": "v1",
+                "tokenizer": "tokenizer-32768",
+            },
+            "data/dataset_data.json",
+        )
+
         muon_params = self.get_muon_params(model)
         adamw_params = self.get_adamw_params(model, muon_params)
-
 
         muon_ids = {id(p) for p in muon_params}
         for name, p in model.named_parameters():

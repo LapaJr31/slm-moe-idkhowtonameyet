@@ -74,7 +74,7 @@ def main():
         num_experts=8,
         d_ffn=960,
         top_k=2,
-        attn_implementation="sdpa",
+        attn_implementation="flex",
     )
     trainer = preTrain(ds, model, run_type="rehearsal_full_ds")
     if latest_ckpt.exists():
