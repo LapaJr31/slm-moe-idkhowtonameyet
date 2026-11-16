@@ -89,3 +89,28 @@ def test_random_dataset_50_steps():
             optimizer.step()
     assert sum(losses[-5:]) < sum(losses[:5])
     print(f"50-step random dataset loss: {losses[0]:.4f} -> {losses[-1]:.4f}")
+
+
+@pytest.mark.parametrize("training", [False, True])
+def test_capacity_overflow_preserves_prefix(training):
+    from moe_slm.model import TransformerBlock
+
+    block = TransformerBlock(4, 2, 1, 2, 24, 1,
+                             max_seq_len=8, attn_implementation="sdpa")
+    block.train(training)
+    with torch.no_grad():
+        block.attn.o_proj.weight.zero_()
+        block.moe.router.weight.zero_()
+        block.moe.router.weight[:, 0].copy_(torch.tensor([5., -5.]))
+        block.moe.w13.fill_(.1)
+        block.moe.w2.fill_(.1)
+    original = torch.ones(2, 8, 4)
+    original[:, 4:, 0] = -1
+    changed = original.clone()
+    changed[:, 4:, 0] = 1
+    before = block(original, None, None, None)[0]
+    after = block(changed, None, None, None)[0]
+    assert block.moe.drop_rate > 0
+    torch.testing.assert_close(before[:, :4], after[:, :4], atol=1e-6, rtol=1e-5)
+    after.square().mean().backward()
+    assert torch.isfinite(block.moe.w13.grad).all()

@@ -3,20 +3,19 @@ import os
 from pathlib import Path
 
 from transformers import AutoTokenizer
+from datasets import load_from_disk
 
 from .model import MoESLM
 from .dataset import Dataset_Mixed
 from .tokenizer import BPETokenizer, train_bpe_on_mix
 from .train import preTrain
 
-VOCAB_SIZE = 50000
+VOCAB_SIZE = 32768
 SEQLEN = preTrain.SEQLEN
-SUBSAMPLE_TOKENS = 100e6
+SUBSAMPLE_TOKENS = False
 
 
 def main():
-    from datasets import load_from_disk
-
     out = "tokenizers/smol-data-1b-50k"
     ds_path = Path("dataset/")
     have_tokenizer = os.path.exists(os.path.join(out, "tokenizer.json"))
@@ -33,8 +32,9 @@ def main():
     else:
         mix = Dataset_Mixed(
             testing=True,
-            total_tokens_b=1.0,
+            total_tokens_b=10.0,
             tokenizer="HuggingFaceTB/SmolLM2-1.7B",
+            num_workers=5,
         )
 
         if have_tokenizer:
@@ -67,15 +67,15 @@ def main():
 
     model = MoESLM(
         vocab_size=VOCAB_SIZE,
-        d_model=1024,
-        n_layers=13,
-        n_q_heads=16,
+        d_model=768,
+        n_layers=12,
+        n_q_heads=12,
         n_kv_heads=4,
         num_experts=8,
-        d_ffn=4224,
+        d_ffn=960,
         top_k=2,
     )
-    trainer = preTrain(ds, model, run_type="rehearsal_100m")
+    trainer = preTrain(ds, model, run_type="rehearsal_full_ds")
     if latest_ckpt.exists():
         trainer.load_checkpoint(latest_ckpt)
     trainer.train()

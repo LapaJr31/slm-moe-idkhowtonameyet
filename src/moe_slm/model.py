@@ -341,8 +341,10 @@ class TransformerBlock(nn.Module):
         x = x + self.attn(self.attn_norm(x), block_mask, attention_mask, position_ids)
 
         B, T, D = x.shape
-        moe_out, aux, z_loss = self.moe(self.moe_norm(x).view(B * T, D))
-        return x + moe_out.view(B, T, D), aux, z_loss
+        # Capacity goes to earlier positions before later positions in any sequence.
+        moe_in = self.moe_norm(x).transpose(0, 1).reshape(T * B, D)
+        moe_out, aux, z_loss = self.moe(moe_in)
+        return x + moe_out.view(T, B, D).transpose(0, 1), aux, z_loss
 
 
 class MoESLM(nn.Module):

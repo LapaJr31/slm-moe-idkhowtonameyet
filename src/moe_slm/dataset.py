@@ -1,13 +1,31 @@
 import itertools
 import hashlib
 import os
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 
-from datasets import load_dataset, interleave_datasets, Dataset
+from datasets import load_dataset, interleave_datasets, Dataset, IterableDataset
+from datasets.utils.tqdm import (
+    are_progress_bars_disabled, disable_progress_bars, enable_progress_bars,
+)
+from tqdm.auto import tqdm
 from huggingface_hub import HfFileSystem
 from transformers import AutoTokenizer
 import pyarrow.parquet as pq
 from .tokenizer import BPETokenizer
 from pathlib import Path
+
+
+@contextmanager
+def _quiet_dataset_progress():
+    # Change this global setting once around the worker pool, never per thread.
+    was_disabled = are_progress_bars_disabled()
+    disable_progress_bars()
+    try:
+        yield
+    finally:
+        if not was_disabled:
+            enable_progress_bars()
 
 
 def _parquet_text_stream(name: str, text_column: str = "text", batch_rows: int = 1024):
@@ -26,6 +44,7 @@ def _interleave_streams(sources, probabilities, seed=42):
     import random
 
     rng = random.Random(seed)
+    probabilities = list(probabilities)
     iters = [iter(s) for s in sources]
     while iters:
         it = rng.choices(iters, weights=probabilities, k=1)[0]
@@ -53,7 +72,9 @@ def load_stream(name: str, text_column: str = "text", buffer_size: int = 10000):
         for text in buf:
             yield {"text": text}
 
-    return shuffled()
+    # Keep a restartable factory: live generators cannot be fingerprinted by
+    # Dataset.from_generator and would be exhausted by tokenizer training.
+    return IterableDataset.from_generator(shuffled)
 
 
 def _make_token_counter(tokenizer, text_stream, text_column, bpe_vocab_size, bpe_train_docs):
@@ -77,7 +98,8 @@ def _make_token_counter(tokenizer, text_stream, text_column, bpe_vocab_size, bpe
     hf = AutoTokenizer.from_pretrained(tokenizer)
 
     def count(texts):
-        return [len(ids) for ids in hf(texts, add_special_tokens=False)["input_ids"]]
+        # Only counting tokens here; long documents never enter the model.
+        return [len(ids) for ids in hf(texts, add_special_tokens=False, verbose=False)["input_ids"]]
 
     return count
 
@@ -98,17 +120,20 @@ def _token_count_budget(
         )
         counted = 0
         done = False
-        while not done:
-            texts = list(itertools.islice(text_stream, batch_size))
-            if not texts:
-                break
-            lengths = count(texts)
-            for text, n in zip(texts, lengths):
-                yield {"text": text}
-                counted += n
-                if counted >= tokens:
-                    done = True
+        with tqdm(total=tokens, desc=name.rsplit("/", 1)[-1],
+                  unit="tok", unit_scale=True, dynamic_ncols=True) as progress:
+            while not done:
+                texts = list(itertools.islice(text_stream, batch_size))
+                if not texts:
                     break
+                lengths = count(texts)
+                for text, n in zip(texts, lengths):
+                    yield {"text": text}
+                    counted += n
+                    progress.update(n)
+                    if counted >= tokens:
+                        done = True
+                        break
 
     return gen
 
@@ -136,7 +161,7 @@ def tokenize_to_disk(
             if not batch:
                 break
             texts = [ex[text_column] if isinstance(ex, dict) else ex for ex in batch]
-            enc = tokenizer(texts, add_special_tokens=False)["input_ids"]
+            enc = tokenizer(texts, add_special_tokens=False, verbose=False)["input_ids"]
             for ids in enc:
                 if eos_id is not None:
                     buf.extend(ids)
@@ -180,6 +205,7 @@ def load_exact(
     )
 
     if os.path.exists(cache_dir):
+        tqdm.write(f"{name.rsplit('/', 1)[-1]}: using cached {tokens:,}-token source")
         ds = Dataset.load_from_disk(cache_dir)
     else:
         os.makedirs(os.path.dirname(cache_dir), exist_ok=True)
@@ -210,7 +236,10 @@ class Dataset_Mixed:
         probabilities=[0.35, 0.25, 0.20, 0.1, 0.1],
         tokenizer=None,
         text_column: str = "text",
+        num_workers: int = 4,
     ):
+        if num_workers < 1:
+            raise ValueError("num_workers must be at least 1")
         self.datasets = datasets
         self.testing = testing
         self.seed = seed
@@ -221,10 +250,14 @@ class Dataset_Mixed:
             if len(datasets) > 1:
                 assert len(probabilities) == len(datasets)
                 budgets = [int(total_tokens * p) for p in probabilities]
-                sources = [
-                    load_exact(x, budget, self.tokenizer, text_column, seed)
-                    for x, budget in zip(datasets, budgets)
-                ]
+                # Each worker owns a source and its token counter. Keep results
+                # in source order so the mixture probabilities stay aligned.
+                with _quiet_dataset_progress(), ThreadPoolExecutor(max_workers=min(num_workers, len(datasets))) as pool:
+                    futures = [
+                        pool.submit(load_exact, x, budget, self.tokenizer, text_column, seed)
+                        for x, budget in zip(datasets, budgets)
+                    ]
+                    sources = [future.result() for future in futures]
                 mix = interleave_datasets(
                     sources,
                     probabilities=probabilities,
@@ -232,14 +265,22 @@ class Dataset_Mixed:
                     stopping_strategy="all_exhausted_without_replacement",
                 )
             else:
-                mix = load_exact(
-                    datasets[0], total_tokens, self.tokenizer, text_column, seed
-                )
+                with _quiet_dataset_progress():
+                    mix = load_exact(
+                        datasets[0], total_tokens, self.tokenizer, text_column, seed
+                    )
         else:
             if len(datasets) > 1:
                 assert len(probabilities) == len(datasets)
                 sources = [load_stream(x, text_column) for x in datasets]
-                mix = _interleave_streams(sources, list(probabilities), seed)
+                mix = IterableDataset.from_generator(
+                    _interleave_streams,
+                    gen_kwargs={
+                        "sources": sources,
+                        "probabilities": list(probabilities),
+                        "seed": seed,
+                    },
+                )
             else:
                 mix = load_stream(datasets[0], text_column)
 
