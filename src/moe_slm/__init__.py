@@ -76,7 +76,7 @@ def main():
         top_k=2,
         attn_implementation="flex",
     )
-    trainer = preTrain(ds, model, run_type="rehearsal_full_ds")
+    trainer = preTrain(ds, model, run_type="benchmarking_CE")
     if latest_ckpt.exists():
         trainer.load_checkpoint(latest_ckpt)
     trainer.train()

@@ -78,7 +78,7 @@ class ExpertMuon(optim.Muon):
 
 
 class preTrain:
-    EPOCHS = 10
+    EPOCHS = 1
     BATCH_SIZE = 64        # micro-batch
     GRAD_ACCUM = 1        # effective batch BATCH_SIZE * GRAD_ACCUM
     TIME_STEPS = 50        # how many optimizer steps to profile timing for
@@ -87,7 +87,7 @@ class preTrain:
     LR_MUON = 0.02
     LR_ADAMW = 3e-4
     SEQLEN = 2048
-    CE_CHUNK = 8192
+    CE_CHUNK = 16384
     SAVE_EVERY = 100
     LOG_EVERY = 50
     CHECKPOINT_DIR = Path("checkpoints")
