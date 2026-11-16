@@ -4,6 +4,56 @@ import torch
 import torch.nn.functional as F
 
 from moe_slm.train import chunked_cross_entropy
+from moe_slm.model import chunked_linear_cross_entropy
+from conftest import tiny_model, random_batch
+
+
+@pytest.mark.parametrize("chunk", [1, 7, 100])
+@pytest.mark.parametrize("ignored", ["some", "all"])
+@pytest.mark.parametrize("bf16", [False, True])
+def test_chunked_projection_loss_and_gradients(device, chunk, ignored, bf16):
+    torch.manual_seed(12)
+    hidden = torch.randn(2, 5, 16, device=device, requires_grad=True)
+    weight = torch.randn(23, 16, device=device, requires_grad=True)
+    targets = torch.randint(0, 23, (2, 5), device=device)
+    targets[:, 2] = -100
+    if ignored == "all":
+        targets.fill_(-100)
+    with torch.autocast(device.type, dtype=torch.bfloat16, enabled=bf16):
+        logits = F.linear(hidden, weight)
+    expected = chunked_cross_entropy(logits, targets, chunk=chunk)
+    expected_grads = torch.autograd.grad(expected, (hidden, weight))
+    with torch.autocast(device.type, dtype=torch.bfloat16, enabled=bf16):
+        actual = chunked_linear_cross_entropy(hidden, weight, targets, chunk=chunk)
+    actual_grads = torch.autograd.grad(actual, (hidden, weight))
+    torch.testing.assert_close(actual, expected, atol=2e-6, rtol=1e-5)
+    for got, ref in zip(actual_grads, expected_grads):
+        # BF16 chunked matmuls accumulate weight gradients in a different order.
+        torch.testing.assert_close(got, ref, atol=5e-3 if bf16 else 2e-6, rtol=1e-2 if bf16 else 1e-5)
+    with torch.no_grad(), torch.autocast(device.type, dtype=torch.bfloat16, enabled=bf16):
+        evaluated = chunked_linear_cross_entropy(hidden, weight, targets, chunk=chunk)
+    torch.testing.assert_close(evaluated, expected.detach(), atol=2e-6, rtol=1e-5)
+
+
+@pytest.mark.parametrize("compiled", [False, True])
+@pytest.mark.parametrize("tied", [False, True])
+def test_model_loss_path_matches_logits_and_all_gradients(compiled, tied):
+    torch.manual_seed(13)
+    model = tiny_model(attn_implementation="sdpa", tie_embeddings=tied)
+    ids = random_batch(batch_size=2, seqlen=5)["input_ids"]
+    logits, aux, z = model(ids)
+    expected = chunked_cross_entropy(logits, ids) + 0.01 * (aux + z)
+    expected.backward()
+    grads = {name: p.grad.clone() for name, p in model.named_parameters()}
+    model.zero_grad(set_to_none=True)
+    # AOTAutograd exercises checkpoint tracing and backward without GPU codegen.
+    run = torch.compile(model, backend="aot_eager", fullgraph=True, dynamic=False) if compiled else model
+    lm, aux, z = run(ids, labels=ids, ce_chunk=3)
+    actual = lm + 0.01 * (aux + z)
+    actual.backward()
+    torch.testing.assert_close(actual, expected)
+    for name, p in model.named_parameters():
+        torch.testing.assert_close(p.grad, grads[name], atol=1e-6, rtol=1e-4)
 
 
 @pytest.mark.parametrize("chunk", [1, 7, 512, 4096, 10**9])

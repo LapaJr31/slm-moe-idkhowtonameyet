@@ -77,9 +77,9 @@ class ExpertMuon(optim.Muon):
 
 
 class preTrain:
-    EPOCHS = 1
-    BATCH_SIZE = 8        # micro-batch
-    GRAD_ACCUM = 8        # effective batch BATCH_SIZE * GRAD_ACCUM
+    EPOCHS = 10
+    BATCH_SIZE = 64        # micro-batch
+    GRAD_ACCUM = 2        # effective batch BATCH_SIZE * GRAD_ACCUM
     TIME_STEPS = 50        # how many optimizer steps to profile timing for
     AUX_COEF = 0.01       # load-balancing loss weight
     Z_COEF = 0.01         # router confidence penalty weight
@@ -114,10 +114,10 @@ class preTrain:
         self.precision = torch.bfloat16
 
         model = model.to(self.device)
-        model.gradient_checkpointing_enable()
+        # model.gradient_checkpointing_enable()
 
         print(f"Compiling model")
-        model = compile_model(model, strategy="whole")
+        model = compile_model(model, mode="max-autotune", strategy="whole")
         print(f"Finished compilation")
 
         if isinstance(dataset_tokenized, Dataset):
@@ -149,6 +149,7 @@ class preTrain:
             adamw_params,
             lr=self.LR_ADAMW,
             weight_decay=0.01,
+            fused=self.device == "cuda",
         )
 
         self.train_dl = self.create_dataloader(
@@ -378,13 +379,11 @@ class preTrain:
                     t0 = time.perf_counter()
                     with torch.set_grad_enabled(train):
                         with torch.autocast("cuda", dtype=self.precision):
-                            logits, aux_loss, z_loss = self.model(
-                                input_ids=batch["input_ids"]
+                            lm_loss, aux_loss, z_loss = self.model(
+                                input_ids=batch["input_ids"],
+                                labels=batch["input_ids"],
+                                ce_chunk=self.CE_CHUNK,
                             )
-
-                        lm_loss = chunked_cross_entropy(
-                            logits, batch["input_ids"], chunk=self.CE_CHUNK
-                        )
 
                         loss = (
                             lm_loss
@@ -421,10 +420,10 @@ class preTrain:
                 grad_norm = None
                 if train:
                     t2 = time.perf_counter()
-                    grad_norm = torch.nn.utils.clip_grad_norm_(
-                        self.model.parameters(),
-                        max_norm=float("inf"),
-                    )
+                    if should_log:
+                        grad_norm = torch.nn.utils.get_total_norm([
+                            p.grad for p in self.model.parameters() if p.grad is not None
+                        ])
 
                     self.adamw.step()
                     self.muon.step()
@@ -528,9 +527,10 @@ class preTrain:
             for batch in loader:
                 batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
                 with torch.autocast("cuda", dtype=self.precision):
-                    logits, aux_loss, z_loss = self.model(input_ids=batch["input_ids"])
-                    lm_loss = chunked_cross_entropy(
-                        logits, batch["input_ids"], chunk=self.CE_CHUNK
+                    lm_loss, aux_loss, z_loss = self.model(
+                        input_ids=batch["input_ids"],
+                        labels=batch["input_ids"],
+                        ce_chunk=self.CE_CHUNK,
                     )
                     total_lm += lm_loss.item()
                     n_batches += 1

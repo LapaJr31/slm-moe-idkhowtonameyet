@@ -149,6 +149,15 @@ def test_training_smoke_saves_checkpoint(tmp_path, monkeypatch):
     trainer.SAVE_EVERY = 100  # avoid checkpoint churn
     trainer.TIME_STEPS = 0    # skip profiling print
 
+    norm_calls = []
+    get_total_norm = torch.nn.utils.get_total_norm
+
+    def tracked_norm(*args, **kwargs):
+        norm_calls.append(1)
+        return get_total_norm(*args, **kwargs)
+
+    monkeypatch.setattr(torch.nn.utils, "get_total_norm", tracked_norm)
+
     # shrink val slice: train.py splits 90/5/5 — with 64 rows val has 3 rows,
     # 1 val batch. Fine.
     trainer.train()
@@ -156,3 +165,5 @@ def test_training_smoke_saves_checkpoint(tmp_path, monkeypatch):
     assert math.isfinite(trainer.best_val_loss)
     assert trainer.total_tokens == int(n_rows * 0.90) * seqlen
     assert (trainer.CHECKPOINT_DIR / "best.pt").exists()
+    # Eight optimizer steps: log only step 5 and the final step, never eval.
+    assert len(norm_calls) == 2

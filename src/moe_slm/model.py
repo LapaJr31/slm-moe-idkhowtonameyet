@@ -347,6 +347,30 @@ class TransformerBlock(nn.Module):
         return x + moe_out.view(T, B, D).transpose(0, 1), aux, z_loss
 
 
+def chunked_linear_cross_entropy(hidden, weight, targets, chunk=8192, ignore_index=-100):
+    if chunk < 1:
+        raise ValueError("chunk must be positive")
+    flat_hidden = hidden[:, :-1].reshape(-1, hidden.shape[-1])
+    flat_targets = targets[:, 1:].reshape(-1)
+
+    def project_and_sum(h, w, t):
+        logits = F.linear(h, w)
+        # Match the existing FP32 CE even under BF16 projection autocast.
+        with torch.autocast(device_type=h.device.type, enabled=False):
+            return F.cross_entropy(
+                logits.float(), t, ignore_index=ignore_index, reduction="sum"
+            )
+
+    total = hidden.new_zeros((), dtype=torch.float32)
+    for start in range(0, flat_targets.numel(), chunk):
+        args = (flat_hidden[start:start + chunk], weight, flat_targets[start:start + chunk])
+        if torch.is_grad_enabled():
+            total = total + checkpoint(project_and_sum, *args, use_reentrant=False)
+        else:
+            total = total + project_and_sum(*args)
+    return total / (flat_targets != ignore_index).sum().clamp(min=1)
+
+
 class MoESLM(nn.Module):
     def __init__(
         self,
@@ -399,7 +423,7 @@ class MoESLM(nn.Module):
     def gradient_checkpointing_enable(self):
         self.gradient_checkpointing = True
 
-    def forward(self, input_ids, attention_mask=None):
+    def forward(self, input_ids, attention_mask=None, labels=None, ce_chunk=8192):
         if attention_mask is not None and bool(attention_mask.all()):
             attention_mask = None
 
@@ -437,12 +461,16 @@ class MoESLM(nn.Module):
             aux_total += block_aux
             z_total +=  block_z
         x = self.norm(x)
+        if labels is not None:
+            return chunked_linear_cross_entropy(
+                x, self.lm_head.weight, labels, chunk=ce_chunk
+            ), aux_total, z_total
         return self.lm_head(x), aux_total, z_total
 
 def compile_model(model: MoESLM, mode: str | None = "default", strategy: str = "whole") -> MoESLM:
     # either whole model or per block of a model
     if strategy == "whole":
-        return torch.compile(model, dynamic=True, mode=mode)
+        return torch.compile(model,fullgraph=True, dynamic=False, mode=mode)
     for block in model.blocks:
         block.compile(dynamic=True, mode=mode)
     return model
