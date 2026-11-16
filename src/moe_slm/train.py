@@ -21,7 +21,7 @@ from rich.progress import (
     TextColumn,
     MofNCompleteColumn,
 )
-from .model import MoESLM, compile_model
+from .model import MoESLM, compile_model, get_causal_block_mask
 
 
 def _fmt_hms(sec: float) -> str:
@@ -116,6 +116,9 @@ class preTrain:
 
         model = model.to(self.device)
         # model.gradient_checkpointing_enable()
+
+        if model.attn_implementation == "flex":
+            get_causal_block_mask(self.SEQLEN, next(model.parameters()).device)
 
         print(f"Compiling model")
         model = compile_model(model, mode="max-autotune", strategy="whole")
