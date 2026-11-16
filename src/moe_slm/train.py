@@ -406,8 +406,12 @@ class preTrain:
                         f"optimizer: {t['opt']:.2f}s ({t['opt']/total*100:.1f}%)"
                     )
                 if train:
-                    self.adamw.zero_grad(set_to_none=True)
-                    self.muon.zero_grad(set_to_none=True)
+                    self.adamw.zero_grad(set_to_none=accum == 1)
+                    self.muon.zero_grad(set_to_none=accum == 1)
+                    if accum > 1:
+                        for p in self.model.parameters():
+                            if p.requires_grad and p.grad is None:
+                                p.grad = torch.zeros_like(p)
 
                 step_loss = torch.zeros((), device=self.device)
                 step_aux = torch.zeros_like(step_loss)

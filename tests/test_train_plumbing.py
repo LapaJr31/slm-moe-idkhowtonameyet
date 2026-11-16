@@ -159,6 +159,17 @@ def test_training_smoke_saves_checkpoint(tmp_path, monkeypatch, capsys, benchmar
 
     monkeypatch.setattr(torch.nn.utils, "get_total_norm", tracked_norm)
 
+    grad_buffers = []
+
+    def check_grad_buffers(module, args):
+        if module.training:
+            pointers = tuple(p.grad.data_ptr() for p in module.parameters() if p.requires_grad)
+            if grad_buffers:
+                assert pointers == grad_buffers[0]
+            grad_buffers.append(pointers)
+
+    model.register_forward_pre_hook(check_grad_buffers)
+
     # shrink val slice: train.py splits 90/5/5 — with 64 rows val has 3 rows,
     # 1 val batch. Fine.
     if benchmark:
@@ -168,6 +179,7 @@ def test_training_smoke_saves_checkpoint(tmp_path, monkeypatch, capsys, benchmar
         assert trainer.total_tokens == 6 * 4 * 2 * seqlen
         assert not list(trainer.CHECKPOINT_DIR.glob("*.pt"))
         assert len(norm_calls) == 0
+        assert len(grad_buffers) == 12  # six steps, two micro-batches each
         output = capsys.readouterr().out
         assert "timed_steps=4 tokens=2,048" in output
         assert "tok/s=" in output
@@ -180,3 +192,4 @@ def test_training_smoke_saves_checkpoint(tmp_path, monkeypatch, capsys, benchmar
     assert (trainer.CHECKPOINT_DIR / "best.pt").exists()
     # Eight optimizer steps: log only step 5 and the final step, never eval.
     assert len(norm_calls) == 2
+    assert len(grad_buffers) == len(trainer.train_dl)
