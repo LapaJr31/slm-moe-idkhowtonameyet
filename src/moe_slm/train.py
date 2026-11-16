@@ -88,7 +88,7 @@ class preTrain:
     LR_ADAMW = 3e-4
     SEQLEN = 2048
     CE_CHUNK = 8192
-    SAVE_EVERY = 100
+    SAVE_EVERY = 1000
     LOG_EVERY = 50
     CHECKPOINT_DIR = Path("checkpoints")
 
@@ -124,7 +124,8 @@ class preTrain:
 
         print(f"Compiling model")
         model = compile_model(model, mode="max-autotune", strategy="whole")
-        torch.cuda.synchronize()
+        if self.device == "cuda":
+            torch.cuda.synchronize()
         print(f"Finished compilation")
 
         if isinstance(dataset_tokenized, Dataset):

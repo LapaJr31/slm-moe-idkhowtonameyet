@@ -46,7 +46,7 @@ def test_model_loss_path_matches_logits_and_all_gradients(compiled, tied):
     expected.backward()
     grads = {name: p.grad.clone() for name, p in model.named_parameters()}
     model.zero_grad(set_to_none=True)
-    # AOTAutograd exercises checkpoint tracing and backward without GPU codegen.
+    # AOTAutograd exercises compiled forward/backward without GPU codegen.
     run = torch.compile(model, backend="aot_eager", fullgraph=True, dynamic=False) if compiled else model
     lm, aux, z = run(ids, labels=ids, ce_chunk=3)
     actual = lm + 0.01 * (aux + z)

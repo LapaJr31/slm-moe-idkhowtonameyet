@@ -348,6 +348,7 @@ class TransformerBlock(nn.Module):
 
 
 def chunked_linear_cross_entropy(hidden, weight, targets, chunk=8192, ignore_index=-100):
+    """Chunk projection and FP32 CE, retaining intermediates for backward."""
     if chunk < 1:
         raise ValueError("chunk must be positive")
     flat_hidden = hidden[:, :-1].reshape(-1, hidden.shape[-1])
@@ -364,10 +365,7 @@ def chunked_linear_cross_entropy(hidden, weight, targets, chunk=8192, ignore_ind
     total = hidden.new_zeros((), dtype=torch.float32)
     for start in range(0, flat_targets.numel(), chunk):
         args = (flat_hidden[start:start + chunk], weight, flat_targets[start:start + chunk])
-        if torch.is_grad_enabled():
-            total = total + checkpoint(project_and_sum, *args, use_reentrant=False)
-        else:
-            total = total + project_and_sum(*args)
+        total = total + project_and_sum(*args)
     return total / (flat_targets != ignore_index).sum().clamp(min=1)
 
 
