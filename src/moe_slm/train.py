@@ -80,12 +80,12 @@ class ExpertMuon(optim.Muon):
 class preTrain:
     EPOCHS = 10
     BATCH_SIZE = 64        # micro-batch
-    GRAD_ACCUM = 2        # effective batch BATCH_SIZE * GRAD_ACCUM
+    GRAD_ACCUM = 1        # effective batch BATCH_SIZE * GRAD_ACCUM
     TIME_STEPS = 50        # how many optimizer steps to profile timing for
     AUX_COEF = 0.01       # load-balancing loss weight
     Z_COEF = 0.01         # router confidence penalty weight
-    LR_MUON = 0.04
-    LR_ADAMW = 6e-4
+    LR_MUON = 0.02
+    LR_ADAMW = 3e-4
     SEQLEN = 2048
     CE_CHUNK = 8192
     SAVE_EVERY = 100
