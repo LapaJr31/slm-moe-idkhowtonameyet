@@ -67,6 +67,37 @@ def test_muon_split_updates_and_roundtrips():
     assert all(p.grad is None for p in muon)
 
 
+def test_expert_layout_loads_legacy_weights_and_preserves_muon_updates():
+    torch.manual_seed(23)
+    model = small_model()
+    legacy = copy.deepcopy(model)
+    # Emulate checkpoint tensors and parameters from the old row-major layout.
+    for block in legacy.blocks:
+        block.moe.w13 = torch.nn.Parameter(block.moe.w13.contiguous())
+        block.moe.w2 = torch.nn.Parameter(block.moe.w2.contiguous())
+    model.load_state_dict(legacy.state_dict())
+    for block in model.blocks:
+        assert block.moe.w13.transpose(1, 2).is_contiguous()
+        assert block.moe.w2.transpose(1, 2).is_contiguous()
+
+    params = preTrain.get_muon_params(model)
+    old_params = preTrain.get_muon_params(legacy)
+    optimizer = ExpertMuon(params, lr=.01)
+    old_optimizer = ExpertMuon(old_params, lr=.01)
+    for _ in range(2):
+        for p, old_p in zip(params, old_params):
+            grad = torch.randn(p.shape)
+            p.grad = torch.empty_like(p).copy_(grad)
+            old_p.grad = grad.clone()
+        optimizer.step()
+        old_optimizer.step()
+        for p, old_p in zip(params, old_params):
+            torch.testing.assert_close(p, old_p, atol=1e-6, rtol=1e-4)
+    ids = torch.randint(32, (2, 8))
+    for actual, expected in zip(model(ids), legacy(ids)):
+        torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-4)
+
+
 @pytest.mark.slow
 def test_random_dataset_50_steps():
     torch.manual_seed(17)

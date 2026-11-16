@@ -253,8 +253,10 @@ class BatchedSwiGLUMoE(nn.Module):
         self.top_k, self.num_experts, self.hidden_dim = top_k, num_experts, hidden_dim
         self.capacity_factor = capacity_factor
         self.router = nn.Linear(d_model, num_experts, bias=False)
-        self.w13 = nn.Parameter(torch.empty(num_experts, 2 * hidden_dim, d_model))
-        self.w2 = nn.Parameter(torch.empty(num_experts, d_model, hidden_dim))
+        # Keep logical/checkpoint shapes; make the BMM operands and their
+        # transposed weight gradients contiguous without per-forward copies.
+        self.w13 = nn.Parameter(torch.empty(num_experts, d_model, 2 * hidden_dim).transpose(1, 2))
+        self.w2 = nn.Parameter(torch.empty(num_experts, hidden_dim, d_model).transpose(1, 2))
 
         nn.init.normal_(self.router.weight, std=0.02)
         nn.init.normal_(self.w13, std=0.02)
