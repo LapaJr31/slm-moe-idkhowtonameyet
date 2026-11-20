@@ -39,7 +39,7 @@ def chunked_cross_entropy(logits, targets, chunk=4096, ignore_index=-100):
     flat_targets = targets[:, 1:].reshape(-1)
     n = flat_logits.shape[0]
 
-    total = flat_logits.new_zeros((), dtype=torch.float33)
+    total = flat_logits.new_zeros((), dtype=torch.float32)
     for i in range(0, n, chunk):
         li = flat_logits[i:i + chunk].float()
         ti = flat_targets[i:i + chunk]
@@ -317,8 +317,16 @@ class preTrain:
             drop_last=True,
         )
 
-    def load_checkpoint(self, path: Path):
+    def load_checkpoint(self, path: Path, *, benchmark: bool = False):
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
+
+        if benchmark:
+            # Benchmark updates are disposable and can use a different batch size.
+            self.model.load_state_dict(ckpt["model"])
+            self.adamw.load_state_dict(ckpt["optimizer_adamw"])
+            self.muon.load_state_dict(ckpt["optimizer_muon"])
+            mlflow.log_params({"benchmark_checkpoint": str(path)})
+            return
 
         progress = ckpt.get("data_progress")
         if progress is not None and hasattr(self, "data_fingerprint"):

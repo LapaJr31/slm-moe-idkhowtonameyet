@@ -6,6 +6,13 @@ from transformers import PreTrainedTokenizerFast
 from moe_slm import dataset as dataset_module
 
 
+@pytest.fixture(autouse=True)
+def isolated_huggingface_cache(monkeypatch, tmp_path):
+    import datasets.config
+
+    monkeypatch.setattr(datasets.config, "HF_DATASETS_CACHE", str(tmp_path / "hf_cache"))
+
+
 def test_budgeted_sources_load_concurrently(monkeypatch):
     from threading import Barrier
 

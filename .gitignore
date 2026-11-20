@@ -33,3 +33,5 @@ checkpoints/
 report1.nsys-rep
 profiling/report1.sqlite
 profiling/
+
+*.log
