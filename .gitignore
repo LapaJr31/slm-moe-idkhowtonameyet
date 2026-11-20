@@ -30,3 +30,6 @@ tokenizers_bak/smol-data-1b-50k/
 junk/
 archives/
 checkpoints/
+report1.nsys-rep
+profiling/report1.sqlite
+profiling/

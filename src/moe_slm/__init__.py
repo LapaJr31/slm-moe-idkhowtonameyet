@@ -19,11 +19,17 @@ SUBSAMPLE_TOKENS = False
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--benchmark-batch-size", type=int)
+        "--benchmark-batch-size", type=int,
+        help="Benchmark this micro-batch size; sizes up to 64 must divide 64.",
+    )
     args = parser.parse_args()
     if args.benchmark_batch_size is not None:
+        if args.benchmark_batch_size < 1 or (
+            args.benchmark_batch_size < 64 and 64 % args.benchmark_batch_size
+        ):
+            parser.error("benchmark batch size must be positive and divide 64 when below 64")
         preTrain.BATCH_SIZE = args.benchmark_batch_size
-        preTrain.GRAD_ACCUM = 64 // args.benchmark_batch_size
+        preTrain.GRAD_ACCUM = max(1, 64 // args.benchmark_batch_size)
 
     out = "tokenizers/smol-data-1b-50k"
     ds_path = Path("dataset/")
@@ -72,7 +78,7 @@ def main():
 
     latest_ckpt = Path("checkpoints/latest.pt")
     if latest_ckpt.exists():
-        print(f"resuming from checkpoint {latest_ckpt}")
+        print(f"{'loading benchmark state' if args.benchmark_batch_size is not None else 'resuming'} from checkpoint {latest_ckpt}")
 
     model = MoESLM(
         vocab_size=VOCAB_SIZE,
@@ -85,10 +91,10 @@ def main():
         top_k=2,
         attn_implementation="flex",
     )
-    trainer = preTrain(ds, model, run_type="benchmark_batch" if args.benchmark_batch_size else "benchmarking_CE")
+    trainer = preTrain(ds, model, run_type="benchmark_batch" if args.benchmark_batch_size is not None else "benchmarking_CE")
     if latest_ckpt.exists():
-        trainer.load_checkpoint(latest_ckpt)
-    if args.benchmark_batch_size:
+        trainer.load_checkpoint(latest_ckpt, benchmark=args.benchmark_batch_size is not None)
+    if args.benchmark_batch_size is not None:
         try:
             trainer.run_epoch(trainer.train_dl, benchmark_steps=15)
         finally:

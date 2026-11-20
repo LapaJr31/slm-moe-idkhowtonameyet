@@ -1,6 +1,8 @@
 import itertools
 import math
+import os
 import time
+import warnings
 
 import mlflow
 import torch
@@ -8,7 +10,7 @@ import torch.optim as optim
 import torch.nn.functional as F
 
 from torch.optim.lr_scheduler import LambdaLR
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Sampler
 
 from datasets import load_from_disk, Dataset
 from mlflow.data.huggingface_dataset import from_huggingface
@@ -37,7 +39,7 @@ def chunked_cross_entropy(logits, targets, chunk=4096, ignore_index=-100):
     flat_targets = targets[:, 1:].reshape(-1)
     n = flat_logits.shape[0]
 
-    total = flat_logits.new_zeros((), dtype=torch.float32)
+    total = flat_logits.new_zeros((), dtype=torch.float33)
     for i in range(0, n, chunk):
         li = flat_logits[i:i + chunk].float()
         ti = flat_targets[i:i + chunk]
@@ -75,6 +77,23 @@ class ExpertMuon(optim.Muon):
                     source.grad = None
                 else:
                     source.grad.zero_()
+
+
+class EpochSampler(Sampler):
+    """Recreate an epoch's permutation and start at a consumed sample offset."""
+    def __init__(self, dataset, seed):
+        self.dataset = dataset
+        self.seed = seed
+        self.epoch = 0
+        self.offset = 0
+
+    def __iter__(self):
+        generator = torch.Generator().manual_seed(self.seed + self.epoch)
+        indices = torch.randperm(len(self.dataset), generator=generator).tolist()
+        return itertools.islice(indices, self.offset, None)
+
+    def __len__(self):
+        return max(0, len(self.dataset) - self.offset)
 
 
 class preTrain:
@@ -133,6 +152,8 @@ class preTrain:
         else:
             dataset = load_from_disk(dataset_tokenized)
         dataset = dataset.with_format("torch")
+        self.data_fingerprint = dataset._fingerprint
+        self.seed = seed
         n = len(dataset)
         train_slice = dataset.select(range(int(n * 0.90)))
         val_slice = dataset.select(range(int(n * 0.90), int(n * 0.95)))
@@ -192,6 +213,7 @@ class preTrain:
             batch=self.BATCH_SIZE,
             num_workers=4,
             shuffle=True,
+            seed=seed,
         )
         self.val_dl = self.create_dataloader(
             val_slice,
@@ -227,6 +249,7 @@ class preTrain:
 
         self.timing = {"bwd": 0.0, "opt": 0.0}
         self.start_epoch = 0
+        self.epoch_batches = 0
         self.best_val_loss = float("inf")
         self.CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -283,18 +306,33 @@ class preTrain:
         ]
 
     @staticmethod
-    def create_dataloader(dataset_slice, batch:int, num_workers:int, shuffle:bool):
+    def create_dataloader(dataset_slice, batch:int, num_workers:int, shuffle:bool, seed:int = 99):
         return DataLoader(
             dataset=dataset_slice,
             batch_size=batch,
             num_workers=num_workers,
             pin_memory=True,
-            shuffle=shuffle,
+            sampler=EpochSampler(dataset_slice, seed) if shuffle else None,
+            generator=torch.Generator().manual_seed(seed),
             drop_last=True,
         )
 
     def load_checkpoint(self, path: Path):
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
+
+        progress = ckpt.get("data_progress")
+        if progress is not None and hasattr(self, "data_fingerprint"):
+            expected = (self.data_fingerprint, self.seed, self.BATCH_SIZE, self.GRAD_ACCUM)
+            saved = (progress["dataset"], progress["seed"], progress["batch_size"], progress["grad_accum"])
+            if saved != expected:
+                raise ValueError("Cannot resume: dataset, seed, batch size, or gradient accumulation differs from the checkpoint")
+            batches = progress["batches"]
+            if not 0 <= batches <= len(self.train_dl) or (batches != len(self.train_dl) and batches % self.GRAD_ACCUM):
+                raise ValueError("Cannot resume: checkpoint batch position is invalid")
+            if progress.get("epochs") != self.EPOCHS:
+                warnings.warn("Epoch count changed; the restored scheduler will follow the new training budget.")
+        elif progress is None:
+            warnings.warn("Legacy checkpoint has no data position or shuffle state; resuming restarts the saved epoch and may repeat data.")
 
         self.model.load_state_dict(ckpt["model"])
         self.adamw.load_state_dict(ckpt["optimizer_adamw"])
@@ -305,12 +343,17 @@ class preTrain:
         self.total_tokens = ckpt["tokens_seen"]
         self.best_val_loss = ckpt["best_val_loss"]
         self.start_epoch = ckpt.get("start_epoch", 0)
+        self.epoch_batches = progress["batches"] if progress is not None else 0
+        if "torch_rng_state" in ckpt:
+            torch.set_rng_state(ckpt["torch_rng_state"].cpu())
+        if self.device == "cuda" and ckpt.get("cuda_rng_state") is not None:
+            torch.cuda.set_rng_state_all([state.cpu() for state in ckpt["cuda_rng_state"]])
 
         mlflow.log_params({"resumed_from": str(path)})
 
     def save_checkpoint(self, name: str):
         path = self.CHECKPOINT_DIR / f"{name}.pt"
-        torch.save({
+        state = {
             "model": self.model.state_dict(),
             "optimizer_adamw": self.adamw.state_dict(),
             "optimizer_muon": self.muon.state_dict(),
@@ -319,7 +362,18 @@ class preTrain:
             "tokens_seen": self.total_tokens,
             "best_val_loss": self.best_val_loss,
             "start_epoch": self.start_epoch,
-        }, path)
+            "torch_rng_state": torch.get_rng_state(),
+            "cuda_rng_state": torch.cuda.get_rng_state_all() if self.device == "cuda" else None,
+        }
+        if hasattr(self, "data_fingerprint"):
+            state["data_progress"] = {
+                "dataset": self.data_fingerprint, "seed": self.seed,
+                "batch_size": self.BATCH_SIZE, "grad_accum": self.GRAD_ACCUM,
+                "epochs": self.EPOCHS, "batches": self.epoch_batches,
+            }
+        temporary = path.with_suffix(".pt.tmp")
+        torch.save(state, temporary)
+        os.replace(temporary, path)
         return path
 
     def run_epoch(
@@ -486,12 +540,15 @@ class preTrain:
                     self.schedule_adamw.step()
                     self.schedule_muon.step()
 
+                    if not benchmark_steps:
+                        self.epoch_batches += len(micros)
+
                     if profile and self.device == "cuda":
                         torch.cuda.synchronize()
                     if profile:
                         self.timing["opt"] += time.perf_counter() - t2
 
-                    if not benchmark_steps and ((step + 1) % self.SAVE_EVERY == 0 or step + 1 == n_steps):
+                    if not benchmark_steps and ((self.epoch_batches // accum) % self.SAVE_EVERY == 0 or step + 1 == n_steps):
                         self.save_checkpoint("latest")
 
                 elapsed = time.perf_counter() - start
@@ -620,11 +677,23 @@ class preTrain:
     def train(self):
         train_vals = {"Train": True, "Val": False}
         print(f"\n{'-' * 50}\nStarting training")
+        ran_epoch = False
         for epoch in range(self.start_epoch, self.EPOCHS):
+            ran_epoch = True
+            self.start_epoch = epoch
+            sampler = self.train_dl.sampler
+            sampler.epoch = epoch
+            sampler.offset = self.epoch_batches * self.BATCH_SIZE
+            if self.epoch_batches:
+                print(f"Resuming epoch {epoch + 1} after {self.epoch_batches} training batches")
             print(f"Epoch {epoch + 1}/{self.EPOCHS}")
 
             for key, flag in train_vals.items():
                 loader = self.train_dl if flag else self.val_dl
+
+                if flag and len(loader) == 0 and self.epoch_batches:
+                    print("Training for this epoch is complete; running validation")
+                    continue
 
                 if self.device == "cuda":
                     torch.cuda.reset_peak_memory_stats()
@@ -671,16 +740,17 @@ class preTrain:
                 }, step=epoch)
 
                 if not flag:
+                    self.start_epoch = epoch + 1
+                    self.epoch_batches = 0
                     if epoch_lm_loss < self.best_val_loss:
                         self.best_val_loss = epoch_lm_loss
                         best_path = self.save_checkpoint("best")
                         mlflow.log_artifact(best_path, artifact_path="checkpoints")
                         mlflow.log_metrics({"best_val_loss": self.best_val_loss}, step=epoch)
                         print(f"! New best val loss, saved {best_path}")
-                    else:
-                        self.save_checkpoint("latest")
+                    self.save_checkpoint("latest")
 
-        if self.start_epoch < self.EPOCHS:
+        if ran_epoch:
             self.run_test()
 
         mlflow.end_run()

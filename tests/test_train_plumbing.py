@@ -121,7 +121,7 @@ def test_grad_accum_scaling_matches_single_batch():
 @pytest.mark.parametrize("benchmark", [False, True])
 def test_training_smoke_saves_checkpoint(tmp_path, monkeypatch, capsys, benchmark):
     """Exercise the trainer, optimizers, token accounting and checkpoint writes."""
-    from moe_slm.train import preTrain
+    from moe_slm.train import EpochSampler, preTrain
     from datasets import Dataset as HFDataset
 
     # Compile correctness is covered separately; keep this plumbing test eager.
@@ -130,8 +130,10 @@ def test_training_smoke_saves_checkpoint(tmp_path, monkeypatch, capsys, benchmar
     monkeypatch.setattr(preTrain, "BATCH_SIZE", 4)
     monkeypatch.setattr(preTrain, "GRAD_ACCUM", 2)
     monkeypatch.setattr(preTrain, "create_dataloader", staticmethod(
-        lambda dataset_slice, batch, num_workers, shuffle: DataLoader(
-            dataset_slice, batch_size=batch, shuffle=shuffle, num_workers=0
+        lambda dataset_slice, batch, num_workers, shuffle, seed=99: DataLoader(
+            dataset_slice, batch_size=batch,
+            sampler=EpochSampler(dataset_slice, seed) if shuffle else None,
+            generator=torch.Generator().manual_seed(seed), num_workers=0
         )
     ))
     torch.manual_seed(0)
@@ -193,3 +195,94 @@ def test_training_smoke_saves_checkpoint(tmp_path, monkeypatch, capsys, benchmar
     # Eight optimizer steps: log only step 5 and the final step, never eval.
     assert len(norm_calls) == 2
     assert len(grad_buffers) == len(trainer.train_dl)
+
+
+@pytest.mark.parametrize("interrupt_at_end", [False, True])
+def test_interrupted_resume_matches_uninterrupted(tmp_path, monkeypatch, interrupt_at_end):
+    import mlflow
+    from datasets import Dataset as HFDataset
+    from moe_slm.train import EpochSampler, preTrain
+
+    monkeypatch.setattr("moe_slm.train.compile_model", lambda model, **kwargs: model)
+    monkeypatch.setattr(preTrain, "BATCH_SIZE", 4)
+    monkeypatch.setattr(preTrain, "GRAD_ACCUM", 2)
+    monkeypatch.setattr(preTrain, "EPOCHS", 1)
+    monkeypatch.setattr(preTrain, "TIME_STEPS", 0)
+    monkeypatch.setattr(preTrain, "LOG_EVERY", 100)
+    monkeypatch.setattr(preTrain, "create_dataloader", staticmethod(
+        lambda dataset_slice, batch, num_workers, shuffle, seed=99: DataLoader(
+            dataset_slice, batch_size=batch,
+            sampler=EpochSampler(dataset_slice, seed) if shuffle else None,
+            generator=torch.Generator().manual_seed(seed), num_workers=0,
+        )
+    ))
+    data = [[i + 1] * 8 for i in range(64)]
+    dataset = HFDataset.from_dict({"input_ids": data})
+    torch.manual_seed(15)
+    initial = tiny_model(vocab_size=256, max_seq_len=8, attn_implementation="sdpa").state_dict()
+
+    def make_trainer(directory, seen):
+        monkeypatch.setattr(preTrain, "CHECKPOINT_DIR", directory)
+        model = tiny_model(vocab_size=256, max_seq_len=8, attn_implementation="sdpa")
+        model.load_state_dict(initial)
+        model.register_forward_pre_hook(
+            lambda module, args, kwargs: seen.extend(kwargs["input_ids"][:, 0].tolist())
+            if module.training else None, with_kwargs=True,
+        )
+        trainer = preTrain(dataset, model, seed=17, run_type="resume_test")
+        trainer.SAVE_EVERY = 100 if interrupt_at_end else 2
+        return trainer
+
+    uninterrupted_seen = []
+    uninterrupted = make_trainer(tmp_path / "baseline", uninterrupted_seen)
+    uninterrupted.train()
+    expected = {name: p.detach().clone() for name, p in uninterrupted.model.named_parameters()}
+
+    resumed_seen = []
+    interrupted = make_trainer(tmp_path / "resumed", resumed_seen)
+    save = interrupted.save_checkpoint
+
+    def stop_after_save(name):
+        result = save(name)
+        if name == "latest":
+            raise RuntimeError("simulated interruption")
+        return result
+
+    interrupted.save_checkpoint = stop_after_save
+    with pytest.raises(RuntimeError, match="simulated interruption"):
+        interrupted.train()
+    mlflow.end_run()
+    restored = make_trainer(tmp_path / "resumed", resumed_seen)
+    restored.BATCH_SIZE = 8
+    with pytest.raises(ValueError, match="batch size"):
+        restored.load_checkpoint(tmp_path / "resumed" / "latest.pt")
+    # A disposable benchmark may use another batch size without resuming data.
+    restored.load_checkpoint(tmp_path / "resumed" / "latest.pt", benchmark=True)
+    assert restored.start_epoch == 0 and restored.epoch_batches == 0
+    for p, saved_p in zip(restored.model.parameters(), interrupted.model.parameters()):
+        torch.testing.assert_close(p, saved_p, rtol=0, atol=0)
+    restored.BATCH_SIZE = 4
+    restored.load_checkpoint(tmp_path / "resumed" / "latest.pt")
+    restored.train()
+
+    assert resumed_seen == uninterrupted_seen
+    assert restored.total_tokens == uninterrupted.total_tokens
+    assert restored.start_epoch == 1 and restored.epoch_batches == 0
+    assert restored.schedule_adamw.last_epoch == uninterrupted.schedule_adamw.last_epoch
+    for name, p in restored.model.named_parameters():
+        torch.testing.assert_close(p, expected[name], rtol=0, atol=0)
+
+
+def test_sampler_resume_uses_consumed_position_not_prefetch():
+    from itertools import islice
+    from moe_slm.train import EpochSampler
+
+    sampler = EpochSampler(range(100), seed=17)
+    sampler.epoch = 3
+    expected = list(sampler)
+    iterator = iter(sampler)
+    assert list(islice(iterator, 20)) == expected[:20]  # workers prefetched ahead
+    resumed = EpochSampler(range(100), seed=17)
+    resumed.epoch = 3
+    resumed.offset = 8  # only these samples were actually consumed
+    assert list(resumed) == expected[8:]
