@@ -22,7 +22,15 @@ def main():
         "--benchmark-batch-size", type=int,
         help="Benchmark this micro-batch size; sizes up to 64 must divide 64.",
     )
+    parser.add_argument("--offload-host", help="SSH host alias or user@host for checkpoint offloading")
+    parser.add_argument("--offload-dir", help="Absolute checkpoint destination directory on the SSH host")
     args = parser.parse_args()
+    if (args.offload_host is None) != (args.offload_dir is None):
+        parser.error("--offload-host and --offload-dir must be provided together")
+    if args.offload_host is not None and args.benchmark_batch_size is not None:
+        parser.error("checkpoint offloading is not used during benchmarks")
+    if args.offload_host is not None and (not args.offload_host or args.offload_host.startswith("-") or not args.offload_dir.startswith("/")):
+        parser.error("offload host must be a valid SSH destination and offload directory must be absolute")
     if args.benchmark_batch_size is not None:
         if args.benchmark_batch_size < 1 or (
             args.benchmark_batch_size < 64 and 64 % args.benchmark_batch_size
@@ -92,13 +100,21 @@ def main():
         attn_implementation="flex",
     )
     trainer = preTrain(ds, model, run_type="benchmark_batch" if args.benchmark_batch_size is not None else "benchmarking_CE")
-    if latest_ckpt.exists():
-        trainer.load_checkpoint(latest_ckpt, benchmark=args.benchmark_batch_size is not None)
-    if args.benchmark_batch_size is not None:
-        try:
+    offloader = None
+    try:
+        if latest_ckpt.exists():
+            trainer.load_checkpoint(latest_ckpt, benchmark=args.benchmark_batch_size is not None)
+        if args.offload_host is not None:
+            from .checkpoint_offload import CheckpointOffloader
+
+            offloader = CheckpointOffloader(trainer.CHECKPOINT_DIR, args.offload_host, args.offload_dir)
+            trainer.offloader = offloader
+        if args.benchmark_batch_size is not None:
             trainer.run_epoch(trainer.train_dl, benchmark_steps=15)
-        finally:
-            import mlflow
-            mlflow.end_run()
-    else:
-        trainer.train()
+        else:
+            trainer.train()
+    finally:
+        if offloader is not None:
+            offloader.close()
+        import mlflow
+        mlflow.end_run()

@@ -98,7 +98,7 @@ class EpochSampler(Sampler):
 
 class preTrain:
     EPOCHS = 1
-    BATCH_SIZE = 64        # micro-batch
+    BATCH_SIZE = 128        # micro-batch
     GRAD_ACCUM = 1        # effective batch BATCH_SIZE * GRAD_ACCUM
     TIME_STEPS = 50        # how many optimizer steps to profile timing for
     AUX_COEF = 0.01       # load-balancing loss weight
@@ -382,6 +382,12 @@ class preTrain:
         temporary = path.with_suffix(".pt.tmp")
         torch.save(state, temporary)
         os.replace(temporary, path)
+        offloader = getattr(self, "offloader", None)
+        if offloader is not None:
+            try:
+                offloader.enqueue(path)
+            except (OSError, RuntimeError) as exc:
+                print(f"[offload] could not queue {path.name}: {exc}; local checkpoint remains available", flush=True)
         return path
 
     def run_epoch(
