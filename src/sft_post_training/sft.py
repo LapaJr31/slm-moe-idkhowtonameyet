@@ -1,31 +1,23 @@
-from pandas.core.algorithms import mode
-import unsloth
-import torch
-import mlflow
 import os
 
-from enum import StrEnum
-from pathlib import Path
-
+import mlflow
+import torch
 from datasets import load_dataset
-from unsloth import FastLanguageModel
-# from accelerate import PartialState
-
-from trl import (
-    SFTConfig,
-    SFTTrainer
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    DataCollatorForSeq2Seq,
+    Trainer,
+    TrainingArguments,
 )
 
-# def log_rank0(*args, **kwargs):
-#     if PartialState().local_process_index == 0:
-#         print(*args, **kwargs)
 
+class MoESLMTrainer(Trainer):
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        return super().compute_loss(
+            model, {**inputs, "loss_only": True}, return_outputs, num_items_in_batch,
+        )
 
-class ATTN(StrEnum):
-    FA2 = "flash_attention_2"
-    FA3 = "flash_attention_3"
-    FA4 = "flash_attention_4"
-    SDPA = "sdpa"
 
 class SFT_Post_train:
     EPOCHS = 2
@@ -35,23 +27,16 @@ class SFT_Post_train:
     SEQLEN = 4096
     LOG_EVERY = 50
     SAVE_EVERY = 1000
-    CHECKPOINT_DIR = Path("checkpoints")
 
     def __init__(
         self,
-        model_id : str,
-        output_dir : str,
-        attn_imp: ATTN | str = ATTN.SDPA,
+        model_id: str,
+        output_dir: str,
         seed: int = 42,
-        run_type: str = "dry_run"
+        run_type: str = "dry_run",
+        *,
+        trust_remote_code: bool = False,
     ):
-
-        try:
-            attn_imp = ATTN(attn_imp)
-        except ValueError as exc:
-            raise ValueError(
-                "attn_imp must be one of: flash_attention_2, flash_attention_3, flash_attention_4, sdpa"
-            ) from exc
 
         self.output_dir = output_dir
         self.seed = seed
@@ -67,33 +52,26 @@ class SFT_Post_train:
 
         torch.manual_seed(self.seed)
 
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-
-        use_bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
-        compute_dtype = torch.bfloat16 if use_bf16 else torch.float16
-
-        model, tokenizer = FastLanguageModel.from_pretrained(
-            model_name=model_id,
-            max_seq_length=self.SEQLEN,
-            load_in_4bit=False,
-            full_finetuning=True,
-            dtype=compute_dtype,
-            use_gradient_checkpointing="unsloth",
-            device_map={"": int(os.environ.get("LOCAL_RANK", "0"))},
-            attn_implementation=attn_imp,
+        has_cuda = torch.cuda.is_available()
+        use_bf16 = has_cuda and torch.cuda.is_bf16_supported()
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_id, trust_remote_code=trust_remote_code, attn_implementation="sdpa",
         )
-        self.model = model
-        self.model.print_trainable_parameters()
-
-        self.tokenizer = tokenizer
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            model_id, config=self.model.config, trust_remote_code=trust_remote_code, padding_side="right",
+        )
+        if self.tokenizer.eos_token is None:
+            raise ValueError("The SFT tokenizer requires an EOS token")
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+        self.model.config.pad_token_id = self.tokenizer.pad_token_id
+        self.model.generation_config.pad_token_id = self.tokenizer.pad_token_id
 
         role_tokens = ["<|user|>", "<|assistant|>", "<|system|>"]
-        added = self.tokenizer.add_special_tokens(
-            {"additional_special_tokens": role_tokens}
-        )
-        if added:
-            self.model.resize_token_embeddings(len(self.tokenizer))
+        self.tokenizer.add_special_tokens({"additional_special_tokens": role_tokens}, replace_extra_special_tokens=False)
+        required_vocab_size = max(self.tokenizer.get_vocab().values()) + 1
+        if required_vocab_size > self.model.config.vocab_size:
+            self.model.resize_token_embeddings(required_vocab_size)
 
         self.tokenizer.chat_template = (
             "{% for message in messages %}"
@@ -104,12 +82,13 @@ class SFT_Post_train:
             "{{ message['content'] + eos_token }}"
             "{% endif %}"
             "{% endfor %}"
+            "{% if add_generation_prompt %}{{ '<|assistant|>\\n' }}{% endif %}"
         )
 
         world_size = int(os.environ.get("WORLD_SIZE", "1"))
         assert self.EFFECTIVE_BATCH % (self.MICRO_BATCH * world_size) == 0
 
-        self.training_args = SFTConfig(
+        self.training_args = TrainingArguments(
             output_dir=output_dir,
             num_train_epochs=self.EPOCHS,
 
@@ -119,19 +98,14 @@ class SFT_Post_train:
 
             learning_rate=self.LR,
             lr_scheduler_type="cosine",
-            optim="adamw_torch_fused",
+            optim="adamw_torch_fused" if has_cuda else "adamw_torch",
             warmup_steps=0.03,
             weight_decay=0.01,
 
-            bf16=True,
-            fp16=False,
-            tf32=True,
-
-            max_length=self.SEQLEN,
-            packing=False,
-
-            completion_only_loss=False,
-            assistant_only_loss=True,
+            bf16=use_bf16,
+            fp16=has_cuda and not use_bf16,
+            tf32=has_cuda and torch.cuda.get_device_capability()[0] >= 8,
+            gradient_checkpointing=True,
 
             eval_strategy="epoch",
 
@@ -144,19 +118,33 @@ class SFT_Post_train:
             save_total_limit=4,
 
             dataloader_num_workers=4,
-            dataloader_pin_memory=True,
+            dataloader_pin_memory=has_cuda,
             dataloader_persistent_workers=True,
             dataloader_prefetch_factor=2,
 
-            padding_free=False,
+            prediction_loss_only=True,
 
             seed=seed,
 
             report_to=["mlflow"],
 
-            torch_compile=True,
-            torch_compile_mode="max-autotune"
+            torch_compile=has_cuda,
+            torch_compile_mode="max-autotune" if has_cuda else None,
         )
+
+    def tokenize_batch(self, batch):
+        encoded = self.tokenizer.apply_chat_template(
+            batch["messages"],
+            return_dict=True,
+            return_assistant_tokens_mask=True,
+            truncation=True,
+            max_length=self.SEQLEN,
+        )
+        encoded["labels"] = [
+            [token if is_assistant else -100 for token, is_assistant in zip(ids, mask, strict=True)]
+            for ids, mask in zip(encoded["input_ids"], encoded.pop("assistant_masks"), strict=True)
+        ]
+        return encoded
 
     def init_dataset(self, dataset_id, subset=None, split="train"):
         mlflow.log_dict(
@@ -167,20 +155,23 @@ class SFT_Post_train:
             },
             "data/dataset_data.json"
         )
-        ds = load_dataset(dataset_id, name=subset, split=split).shuffle(seed=self.seed)
-        train_slice = ds.select(range(int(len(ds) * 0.98)))
-        eval_slice = ds.select(range(int(len(ds) * 0.98), len(ds)))
-        return train_slice, eval_slice
+        ds = load_dataset(dataset_id, name=subset, split=split)
+        ds = ds.map(self.tokenize_batch, batched=True, remove_columns=ds.column_names)
+        ds = ds.filter(lambda example: any(label != -100 for label in example["labels"][1:]))
+        if len(ds) < 2:
+            raise ValueError("SFT requires at least two examples with assistant tokens after truncation")
+        splits = ds.train_test_split(test_size=0.02, seed=self.seed)
+        return splits["train"], splits["test"]
 
     def train(self, train_dataset, eval_dataset):
-        trainer = SFTTrainer(
+        trainer = MoESLMTrainer(
             model=self.model,
             args=self.training_args,
             train_dataset=train_dataset,
             eval_dataset= eval_dataset,
             processing_class=self.tokenizer,
+            data_collator=DataCollatorForSeq2Seq(self.tokenizer),
         )
 
         trainer.train()
         trainer.save_model(self.output_dir)
-        self.tokenizer.save_pretrained(self.output_dir)

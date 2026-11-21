@@ -7,6 +7,7 @@ requires-python = "==3.13.*"
 dependencies = [
     "accelerate>=1.16.0",
     "datasets>=5.1.0",
+    "huggingface-hub",
     "mlflow",
     "numpy>=2.5.2",
     "scikit-learn>=1.9.1",
@@ -23,6 +24,7 @@ markers = [
 
 [project.scripts]
 moe_slm = "moe_slm:main"
+moe_slm_export = "moe_slm.export_hf:main"
 
 [build-system]
 requires = ["uv_build>=0.13.5,<0.14.0"]

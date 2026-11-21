@@ -1,39 +1,43 @@
-from .sft import SFT_Post_train
-
-from pathlib import Path
+import argparse
 from contextlib import nullcontext
-from accelerate import PartialState
+from pathlib import Path
 
 import mlflow
+from accelerate import PartialState
 
-MODEL_ID = "lapkaaaa/skynet_0.1_not_killing_anybody_yet"
+from .sft import SFT_Post_train
+
 DATASET_ID = "HuggingFaceTB/smoltalk2"
 SUBSET = "SFT"
 SPLIT = "tulu_3_sft_personas_instruction_following_no_think"
-ATTENTION = "flash_attention_2"
 
 
 SEED = 42
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-OUTPUT_DIR = PROJECT_ROOT / "nli-adapter"
+OUTPUT_DIR = Path("checkpoints/skynet-sft")
 
 RUN_TYPE = "dry_run"
 
 def main():
+    parser = argparse.ArgumentParser(description="Fine-tune a Transformers export of MoESLM.")
+    parser.add_argument("--model", required=True, help="Export directory or Hub repo ID")
+    parser.add_argument("--output-dir", type=Path, default=OUTPUT_DIR)
+    parser.add_argument("--trust-remote-code", action="store_true", help="Load the custom code in a trusted export")
+    args = parser.parse_args()
+
     state = PartialState()
     mlflow_context = nullcontext()
 
     if state.is_main_process:
         mlflow.set_experiment("skynet-sft-posttrain")
-        mlflow.start_run(run_name=f"posttrain-{RUN_TYPE}")
+        mlflow_context = mlflow.start_run(run_name=f"posttrain-{RUN_TYPE}")
 
     with mlflow_context:
         trainer = SFT_Post_train(
-            model_id=MODEL_ID,
-            output_dir=str(OUTPUT_DIR),
-            attn_imp=ATTENTION,
+            model_id=args.model,
+            output_dir=str(args.output_dir),
             seed=SEED,
             run_type=RUN_TYPE,
+            trust_remote_code=args.trust_remote_code,
         )
 
         train, val = trainer.init_dataset(

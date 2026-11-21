@@ -1303,6 +1303,7 @@ source = { editable = "." }
 dependencies = [
     { name = "accelerate" },
     { name = "datasets" },
+    { name = "huggingface-hub" },
     { name = "mlflow" },
     { name = "numpy" },
     { name = "scikit-learn" },
@@ -1333,6 +1334,7 @@ dev = [
 requires-dist = [
     { name = "accelerate", specifier = ">=1.16.0" },
     { name = "datasets", specifier = ">=5.1.0" },
+    { name = "huggingface-hub" },
     { name = "mlflow" },
     { name = "numpy", specifier = ">=2.5.2" },
     { name = "scikit-learn", specifier = ">=1.9.1" },
