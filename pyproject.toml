@@ -10,11 +10,8 @@ dependencies = [
     "mlflow",
     "numpy>=2.5.2",
     "scikit-learn>=1.9.1",
-    "sft-post-training",
     "tokenizers>=0.23.3",
     "transformers>=5.22.2",
-    "trl>=1.18.2",
-    "unsloth>=2025.7.2",
 ]
 
 [tool.pytest.ini_options]
@@ -71,7 +68,6 @@ explicit = true
 prerelease = "allow"
 
 [tool.uv.sources]
-sft-post-training = { path = "src", editable = true }
 torch = [
     { index = "pytorch-cpu", extra = "cpu" },
     { index = "pytorch-cu130", extra = "cu130" },

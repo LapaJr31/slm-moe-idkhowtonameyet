@@ -8,8 +8,8 @@ dependencies = [
     "mlflow",
     "pandas",
     "torch",
-    "trl>=1.18.2",
-    "unsloth",
+    "trl==1.15.0",
+    "unsloth>=2026.11.7",
 ]
 
 [project.scripts]
