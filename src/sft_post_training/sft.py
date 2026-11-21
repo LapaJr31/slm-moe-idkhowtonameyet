@@ -104,7 +104,7 @@ class SFT_Post_train:
 
             bf16=use_bf16,
             fp16=has_cuda and not use_bf16,
-            tf32=has_cuda and torch.cuda.get_device_capability()[0] >= 8,
+            tf32=False,
             gradient_checkpointing=True,
 
             eval_strategy="epoch",
