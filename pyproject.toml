@@ -5,12 +5,14 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = "==3.13.*"
 dependencies = [
+    "accelerate>=1.16.0",
     "datasets>=5.1.0",
     "mlflow",
     "numpy>=2.5.2",
     "scikit-learn>=1.9.1",
     "tokenizers>=0.23.3",
     "transformers>=5.22.2",
+    "unsloth>=2025.7.2",
 ]
 
 [tool.pytest.ini_options]

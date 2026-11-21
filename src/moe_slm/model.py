@@ -1,4 +1,5 @@
 import hashlib
+from fractions import Fraction
 
 import torch
 import torch.nn as nn
@@ -135,16 +136,17 @@ class RotaryPositionalEmbeddings(nn.Module):
         x1, x2 = x.chunk(2, dim=-1)
         return torch.cat((-x2, x1), dim=-1)
 
-    def forward(self, q, k, position_ids=None):
+    def forward(self, q, k, position_ids=None, position_offset=0):
         B, _, T, D = q.shape
         assert D == self.dim
         assert k.shape[0] == B and k.shape[-2:] == (T, D)
 
-        self._ensure_capacity(T)
+        end = position_offset + T
+        self._ensure_capacity(end)
 
         if position_ids is None:
-            cos = self.cos_cached[:T].view(1, 1, T, D)
-            sin = self.sin_cached[:T].view(1, 1, T, D)
+            cos = self.cos_cached[position_offset:end].view(1, 1, T, D)
+            sin = self.sin_cached[position_offset:end].view(1, 1, T, D)
         else:
             pos = position_ids.long()
             cos = self.cos_cached[pos]
@@ -160,19 +162,35 @@ class RotaryPositionalEmbeddings(nn.Module):
         k = k * cos.to(k.dtype) + self._rotate_half(k) * sin.to(k.dtype)
         return q, k
 
-#todo
 class KVcache(nn.Module):
     def __init__(self, d_size, n_layers, n_kv_heads, max_seq_len, dtype, device, max_batch_size):
-        pass
+        super().__init__()
+        shape = (n_layers, max_batch_size, n_kv_heads, max_seq_len, d_size)
+        self.register_buffer("keys", torch.empty(shape, dtype=dtype, device=device), persistent=False)
+        self.register_buffer("values", torch.empty_like(self.keys), persistent=False)
+        self.reset()
 
     def update(self, layer_idx, k_new, v_new):
-        pass
+        batch_size, heads, seq_len, head_dim = k_new.shape
+        end = self.length + seq_len
+        if heads != self.keys.size(2) or head_dim != self.keys.size(-1):
+            raise ValueError("KV cache shape must match the attention projections")
+        if k_new.dtype != self.keys.dtype or k_new.device != self.keys.device:
+            raise ValueError("KV cache dtype and device must match the attention projections")
+        self.keys[layer_idx, :batch_size, :, self.length:end].copy_(k_new)
+        self.values[layer_idx, :batch_size, :, self.length:end].copy_(v_new)
+        return self.keys[layer_idx, :batch_size, :, :end], self.values[layer_idx, :batch_size, :, :end]
 
     def get(self, layer_idx):
-        pass
+        batch_size = self.batch_size or self.keys.size(1)
+        return (
+            self.keys[layer_idx, :batch_size, :, :self.length],
+            self.values[layer_idx, :batch_size, :, :self.length],
+        )
 
     def reset(self):
-        pass
+        self.length = 0
+        self.batch_size = None
 
 class GQAAttention(nn.Module):
     def __init__(self, d_model=1024, n_q_heads=16, n_kv_heads=4,
@@ -198,7 +216,7 @@ class GQAAttention(nn.Module):
         )
 
 
-    def forward(self, x, block_mask, attention_mask, position_ids):
+    def forward(self, x, block_mask, attention_mask, position_ids, kv_cache=None, layer_idx=0):
 
         B, T, _ = x.shape
 
@@ -212,9 +230,21 @@ class GQAAttention(nn.Module):
             B, T, self.n_kv_heads, self.head_dim
         ).transpose(1, 2)
 
-        q, k = self.rope(q, k, position_ids)
+        position_offset = 0 if kv_cache is None else kv_cache.length
+        q, k = self.rope(q, k, position_ids, position_offset)
 
-        if self.attn_implementation == "flex":
+        if kv_cache is not None:
+            k, v = kv_cache.update(layer_idx, k, v)
+            mask = None
+            if position_offset and T > 1:
+                key_positions = torch.arange(k.size(-2), device=x.device)
+                query_positions = key_positions[position_offset:]
+                mask = query_positions[:, None] >= key_positions
+            y = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=mask, is_causal=position_offset == 0,
+                enable_gqa=self.enable_gqa,
+            )
+        elif self.attn_implementation == "flex":
             y = flex_attention(
                 q, k, v,
                 block_mask=block_mask,
@@ -235,52 +265,118 @@ class GQAAttention(nn.Module):
         return self.o_proj(y)
 
 class BatchedSwiGLUMoE(nn.Module):
-    def __init__(self, num_experts: int, d_ffn: int, d_model: int = 1024, top_k: int = 2):
+    def __init__(
+        self,
+        num_experts: int,
+        d_ffn: int,
+        d_model: int = 1024,
+        top_k: int = 2,
+        capacity_factor: float = 1.25,
+        n_layers: int = 1,
+    ):
         super().__init__()
-        # 16-byte stride alignment requirement
-        hidden_dim = -(-2 * d_ffn // 3 // 8) * 8
+        if not 1 <= top_k <= num_experts or capacity_factor <= 0 or n_layers < 1:
+            raise ValueError("Invalid routing capacity, top_k, or layer count")
+        hidden_dim = ((2 * d_ffn + 23) // 24) * 8
+
         self.top_k, self.num_experts, self.hidden_dim = top_k, num_experts, hidden_dim
+        self.capacity_factor = capacity_factor
+        # None preserves the exact fixed Top-k routing used in training.
+        self.top_p: float | None = None
+        self.min_k = top_k
+        self.max_k = num_experts
+        self.preserve_top_k_mass = False
+        # Allow drop-free inference without excessive padded expert capacity.
+        self.inference_no_drop = False
         self.router = nn.Linear(d_model, num_experts, bias=False)
-        self.w13 = nn.Parameter(torch.empty(num_experts, 2 * hidden_dim, d_model))
-        self.w2  = nn.Parameter(torch.empty(num_experts, d_model, hidden_dim))
-        for p in (self.w13, self.w2):
-            nn.init.kaiming_uniform_(p, a=5**0.5)
+        self.w13 = nn.Parameter(torch.empty(num_experts, d_model, 2 * hidden_dim).transpose(1, 2))
+        self.w2 = nn.Parameter(torch.empty(num_experts, hidden_dim, d_model).transpose(1, 2))
 
-    @torch.compiler.disable
-    def forward(self, x):
-        logits = self.router(x)
-        if self.training:
-            logits = logits + torch.randn_like(logits) * 0.1
-        scores = logits.float().softmax(-1)
-        topk_scores, topk_ids = scores.topk(self.top_k, -1)
+        nn.init.normal_(self.router.weight, std=0.02)
+        nn.init.normal_(self.w13, std=0.02)
+        nn.init.normal_(self.w2, std=0.02 / (2 * n_layers) ** 0.5)
 
-        flat_ids = topk_ids.reshape(-1)
-        flat_scores = topk_scores.reshape(-1)
-        order = flat_ids.argsort()
-        expert_sorted = flat_ids[order]
-        token_idx = order // self.top_k
-        x_sorted = x[token_idx]
+        self.register_buffer("drop_rate", torch.zeros(()), persistent=False)
+        self.register_buffer("active_expert_assignments", torch.zeros((), dtype=torch.long), persistent=False)
 
-        counts = torch.bincount(expert_sorted, minlength=self.num_experts)
-        offs = counts.cumsum(0, dtype=torch.int32)
+    @property
+    def capacity_factor(self) -> float:
+        return self._capacity_factor
 
-        #gemm 1
-        h13 = torch._grouped_mm(x_sorted, self.w13.transpose(-1, -2), offs=offs)
-        gate, up = h13.split(self.hidden_dim, dim=-1)
-        h2 = F.silu(gate) * up
+    @capacity_factor.setter
+    def capacity_factor(self, value: float) -> None:
+        if value <= 0:
+            raise ValueError("capacity_factor must be positive")
+        factor = Fraction(str(value))
+        self._capacity_factor = value
+        self._capacity_numerator = factor.numerator
+        self._capacity_divisor = factor.denominator
 
-        # gemm 2
-        h3 = torch._grouped_mm(h2, self.w2.transpose(-1, -2), offs=offs)
+    def forward(self, x: torch.Tensor, *, no_drop: bool = False) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        N, D = x.shape
+        E, K = self.num_experts, self.top_k
 
-        P = scores.mean(dim=0)
-        f = counts.detach().float() / flat_ids.numel()
-        aux = self.num_experts * (f*P).sum()
+        logits = self.router(x).float()
+        scores = logits.softmax(-1)
+        z_loss = logits.logsumexp(-1).square().mean()
 
-        z_loss = self.num_experts * (scores ** 2).sum(-1).mean()
+        if self.top_p is None:
+            route_scores, route_experts = scores.topk(K, -1)
+            expert_ids = route_experts.reshape(-1)
+            token_ids = torch.arange(N, device=x.device).repeat_interleave(K)
+        else:
+            if not 0.0 < self.top_p <= 1.0:
+                raise ValueError('top_p must be in (0, 1]')
+            if not 1 <= self.min_k <= self.max_k <= E:
+                raise ValueError('expected 1 <= min_k <= max_k <= num_experts')
 
-        out = torch.zeros_like(x)
-        out.index_add_(0, token_idx, h3 * flat_scores[order, None])
-        return (out, aux, z_loss)
+            # Take the smallest prefix reaching top_p, subject to k bounds.
+            top_scores, top_experts = scores.topk(self.max_k, dim=-1)
+            cumulative = top_scores.cumsum(dim=-1)
+            chosen_k = (cumulative - top_scores < self.top_p).sum(-1)
+            chosen_k = chosen_k.clamp(min=self.min_k, max=self.max_k)
+            active = torch.arange(self.max_k, device=x.device)[None, :] < chosen_k[:, None]
+            if self.preserve_top_k_mass and not self.training:
+                # Keep the trained router's total gate weight for each token.
+                baseline_mass = scores.topk(K, dim=-1).values.sum(dim=-1, keepdim=True)
+                selected_mass = cumulative.gather(1, chosen_k[:, None] - 1)
+                top_scores = top_scores * (baseline_mass / selected_mass)
+            route_scores = top_scores[active]
+            expert_ids = top_experts[active]
+            token_ids = torch.arange(N, device=x.device).repeat_interleave(chosen_k)
+
+        R = expert_ids.numel()
+        counts = torch.zeros(E, device=x.device, dtype=torch.long).scatter_add(
+            0, expert_ids, torch.ones_like(expert_ids)
+        )
+
+        if (self.inference_no_drop or no_drop) and not self.training:
+            C = int(counts.max().item())
+            # Capacity covers every selected route in this branch.
+            self.active_expert_assignments.fill_(R)
+        else:
+            numerator, divisor = self._capacity_numerator, self._capacity_divisor
+            denominator = E * divisor
+            C = (R * numerator + denominator - 1) // denominator
+
+        aux = E * ((counts.float() / R) * scores.mean(0)).sum()
+        perm = expert_ids.argsort(stable=True)
+        sorted_experts = expert_ids[perm]
+        offsets = counts.cumsum(0) - counts
+        slots = torch.arange(R, device=x.device) - offsets[sorted_experts]
+        keep = slots < C
+        self.drop_rate.copy_((~keep).float().mean().detach())
+        token_ids = token_ids[perm]
+        destinations = sorted_experts * C + slots.clamp(max=C - 1)
+        dispatched = x.new_zeros(E * C, D).index_add(
+            0, destinations, x[token_ids] * keep[:, None].to(x.dtype)
+        ).view(E, C, D)
+        gate, up = torch.bmm(dispatched, self.w13.transpose(1, 2)).chunk(2, -1)
+        values = torch.bmm(F.silu(gate) * up, self.w2.transpose(1, 2))
+        weights = route_scores.reshape(-1)[perm] * keep
+        routed = values.reshape(E * C, D)[destinations] * weights[:, None].to(values.dtype)
+        output = torch.zeros_like(x).index_add(0, token_ids, routed.to(x.dtype))
+        return output, aux, z_loss
 
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
@@ -298,20 +394,45 @@ class RMSNorm(nn.Module):
 class TransformerBlock(nn.Module):
     def __init__(self, d_model: int, n_q_heads: int, n_kv_heads: int,
                  num_experts: int, d_ffn: int, top_k: int,
-                 max_seq_len: int = 8192, attn_implementation: str = "flex"):
+                 max_seq_len: int = 8192, attn_implementation: str = "flex",
+                 n_layers: int = 1):
         super().__init__()
         self.attn_norm = RMSNorm(d_model)
         self.attn = GQAAttention(d_model, n_q_heads, n_kv_heads,
                                  max_seq_len, attn_implementation)
         self.moe_norm = RMSNorm(d_model)
-        self.moe = BatchedSwiGLUMoE(num_experts, d_ffn, d_model, top_k)
+        self.moe = BatchedSwiGLUMoE(num_experts, d_ffn, d_model, top_k, n_layers=n_layers)
 
-    def forward(self, x, block_mask, attention_mask, position_ids):
-        x = x + self.attn(self.attn_norm(x), block_mask, attention_mask, position_ids)
+    def forward(self, x, block_mask, attention_mask, position_ids, kv_cache=None, layer_idx=0):
+        x = x + self.attn(self.attn_norm(x), block_mask, attention_mask, position_ids, kv_cache, layer_idx)
 
         B, T, D = x.shape
-        moe_out, aux, z_loss = self.moe(self.moe_norm(x).view(B * T, D))
-        return x + moe_out.view(B, T, D), aux, z_loss
+        # Capacity goes to earlier positions before later positions in any sequence.
+        moe_in = self.moe_norm(x).transpose(0, 1).reshape(T * B, D)
+        moe_out, aux, z_loss = self.moe(moe_in, no_drop=kv_cache is not None)
+        return x + moe_out.view(T, B, D).transpose(0, 1), aux, z_loss
+
+
+def chunked_linear_cross_entropy(hidden, weight, targets, chunk=8192, ignore_index=-100):
+    """Chunk projection and FP32 CE, retaining intermediates for backward."""
+    if chunk < 1:
+        raise ValueError("chunk must be positive")
+    flat_hidden = hidden[:, :-1].reshape(-1, hidden.shape[-1])
+    flat_targets = targets[:, 1:].reshape(-1)
+
+    def project_and_sum(h, w, t):
+        logits = F.linear(h, w)
+        # Match the existing FP32 CE even under BF16 projection autocast.
+        with torch.autocast(device_type=h.device.type, enabled=False):
+            return F.cross_entropy(
+                logits.float(), t, ignore_index=ignore_index, reduction="sum"
+            )
+
+    total = hidden.new_zeros((), dtype=torch.float32)
+    for start in range(0, flat_targets.numel(), chunk):
+        args = (flat_hidden[start:start + chunk], weight, flat_targets[start:start + chunk])
+        total = total + project_and_sum(*args)
+    return total / (flat_targets != ignore_index).sum().clamp(min=1)
 
 
 class MoESLM(nn.Module):
@@ -353,7 +474,7 @@ class MoESLM(nn.Module):
         self.blocks = nn.ModuleList([
             TransformerBlock(d_model, n_q_heads, n_kv_heads,
                              num_experts, d_ffn, top_k,
-                             max_seq_len, attn_implementation)
+                             max_seq_len, attn_implementation, n_layers)
             for _ in range(n_layers)
         ])
         self.norm = RMSNorm(d_model)
@@ -366,11 +487,35 @@ class MoESLM(nn.Module):
     def gradient_checkpointing_enable(self):
         self.gradient_checkpointing = True
 
-    def forward(self, input_ids, attention_mask=None):
+    def make_kv_cache(self, max_seq_len, max_batch_size=1):
+        if max_seq_len < 1 or max_batch_size < 1:
+            raise ValueError("KV cache capacity and batch size must be positive")
+        weight = self.tok_emb.weight
+        device = weight.device
+        dtype = torch.get_autocast_dtype(device.type) if torch.is_autocast_enabled(device.type) else weight.dtype
+        return KVcache(
+            self.blocks[0].attn.head_dim, len(self.blocks), self.config["n_kv_heads"],
+            max_seq_len, dtype, device, max_batch_size,
+        )
+
+    def forward(self, input_ids, attention_mask=None, labels=None, ce_chunk=8192, *, kv_cache=None):
         if attention_mask is not None and bool(attention_mask.all()):
             attention_mask = None
 
-        flex_path = self.attn_implementation == "flex"
+        if kv_cache is not None:
+            if self.training or torch.is_grad_enabled() or labels is not None or attention_mask is not None:
+                raise ValueError("KV caching requires eval mode, disabled gradients, and unpadded inputs without labels")
+            if kv_cache.keys.size(0) != len(self.blocks):
+                raise ValueError("KV cache layer count must match the model")
+            batch_size, seq_len = input_ids.shape
+            if batch_size < 1 or batch_size > kv_cache.keys.size(1) or seq_len < 1:
+                raise ValueError("input batch does not fit the KV cache")
+            if kv_cache.batch_size is not None and batch_size != kv_cache.batch_size:
+                raise ValueError("reset the KV cache before changing the batch size")
+            if kv_cache.length + seq_len > kv_cache.keys.size(-2):
+                raise ValueError("input exceeds the KV cache sequence capacity")
+
+        flex_path = kv_cache is None and self.attn_implementation == "flex"
 
         if attention_mask is None:
 
@@ -393,23 +538,32 @@ class MoESLM(nn.Module):
         z_total = x.new_zeros(())
 
         use_ckpt = self.training and self.gradient_checkpointing and torch.is_grad_enabled()
-        for block in self.blocks:
+        for layer_idx, block in enumerate(self.blocks):
             if use_ckpt:
                 x, block_aux, block_z = checkpoint(
                     block, x, block_mask, padding_mask, position_ids,
                     use_reentrant=False,
                 )
             else:
-                x, block_aux, block_z = block(x, block_mask, padding_mask, position_ids)
+                x, block_aux, block_z = block(x, block_mask, padding_mask, position_ids, kv_cache, layer_idx)
             aux_total += block_aux
             z_total +=  block_z
         x = self.norm(x)
-        return self.lm_head(x), aux_total, z_total
+        if labels is not None:
+            return chunked_linear_cross_entropy(
+                x, self.lm_head.weight, labels, chunk=ce_chunk
+            ), aux_total, z_total
+        logits = self.lm_head(x)
+        if kv_cache is not None:
+            # Commit the shared cursor only after every layer finishes.
+            kv_cache.length += seq_len
+            kv_cache.batch_size = batch_size
+        return logits, aux_total, z_total
 
 def compile_model(model: MoESLM, mode: str | None = "default", strategy: str = "whole") -> MoESLM:
     # either whole model or per block of a model
     if strategy == "whole":
-        return torch.compile(model, dynamic=True, mode=mode)
+        return torch.compile(model,fullgraph=True, dynamic=False, mode=mode)
     for block in model.blocks:
         block.compile(dynamic=True, mode=mode)
     return model

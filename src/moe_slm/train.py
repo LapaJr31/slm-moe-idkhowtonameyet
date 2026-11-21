@@ -1,6 +1,8 @@
 import itertools
 import math
+import os
 import time
+import warnings
 
 import mlflow
 import torch
@@ -8,9 +10,10 @@ import torch.optim as optim
 import torch.nn.functional as F
 
 from torch.optim.lr_scheduler import LambdaLR
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Sampler
 
 from datasets import load_from_disk, Dataset
+from mlflow.data.huggingface_dataset import from_huggingface
 
 
 from pathlib import Path
@@ -20,7 +23,7 @@ from rich.progress import (
     TextColumn,
     MofNCompleteColumn,
 )
-from .model import MoESLM, compile_model
+from .model import MoESLM, compile_model, get_causal_block_mask
 
 
 def _fmt_hms(sec: float) -> str:
@@ -45,18 +48,66 @@ def chunked_cross_entropy(logits, targets, chunk=4096, ignore_index=-100):
     return total / n_valid
 
 
+class ExpertMuon(optim.Muon):
+    def __init__(self, params, **kwargs):
+        self.sources = list(params)
+        self.slices = [
+            [torch.nn.Parameter(part) for part in p.unbind(0)] if p.ndim == 3 else [p]
+            for p in self.sources
+        ]
+        super().__init__([part for parts in self.slices for part in parts], **kwargs)
+
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+        for source, parts in zip(self.sources, self.slices):
+            if source.ndim == 3:
+                for i, part in enumerate(parts):
+                    part.grad = None if source.grad is None else source.grad[i]
+        result = super().step()
+        return loss if closure is not None else result
+
+    def zero_grad(self, set_to_none=True):
+        super().zero_grad(set_to_none=set_to_none)
+        for source in self.sources:
+            if source.ndim == 3 and source.grad is not None:
+                if set_to_none:
+                    source.grad = None
+                else:
+                    source.grad.zero_()
+
+
+class EpochSampler(Sampler):
+    """Recreate an epoch's permutation and start at a consumed sample offset."""
+    def __init__(self, dataset, seed):
+        self.dataset = dataset
+        self.seed = seed
+        self.epoch = 0
+        self.offset = 0
+
+    def __iter__(self):
+        generator = torch.Generator().manual_seed(self.seed + self.epoch)
+        indices = torch.randperm(len(self.dataset), generator=generator).tolist()
+        return itertools.islice(indices, self.offset, None)
+
+    def __len__(self):
+        return max(0, len(self.dataset) - self.offset)
+
+
 class preTrain:
     EPOCHS = 1
-    BATCH_SIZE = 16        # micro-batch
-    GRAD_ACCUM = 16        # effective batch BATCH_SIZE * GRAD_ACCUM
+    BATCH_SIZE = 128        # micro-batch
+    GRAD_ACCUM = 1        # effective batch BATCH_SIZE * GRAD_ACCUM
     TIME_STEPS = 50        # how many optimizer steps to profile timing for
     AUX_COEF = 0.01       # load-balancing loss weight
     Z_COEF = 0.01         # router confidence penalty weight
-    LR_MUON = 0.04
-    LR_ADAMW = 6e-4
+    LR_MUON = 0.02
+    LR_ADAMW = 3e-4
     SEQLEN = 2048
     CE_CHUNK = 8192
-    SAVE_EVERY = 100
+    SAVE_EVERY = 1000
     LOG_EVERY = 50
     CHECKPOINT_DIR = Path("checkpoints")
 
@@ -69,6 +120,8 @@ class preTrain:
         mlflow.log_params({
             "epochs": self.EPOCHS,
             "batch_size": self.BATCH_SIZE,
+            "grad_accum": self.GRAD_ACCUM,
+            "ce_chunk": self.CE_CHUNK,
             "seqlen": self.SEQLEN,
             "lr_muon": self.LR_MUON,
             "lr_adamw": self.LR_ADAMW,
@@ -83,10 +136,15 @@ class preTrain:
         self.precision = torch.bfloat16
 
         model = model.to(self.device)
-        model.gradient_checkpointing_enable()
+        # model.gradient_checkpointing_enable()
+
+        if model.attn_implementation == "flex":
+            get_causal_block_mask(self.SEQLEN, next(model.parameters()).device)
 
         print(f"Compiling model")
-        model = compile_model(model, strategy="whole")
+        model = compile_model(model, mode="max-autotune", strategy="whole")
+        if self.device == "cuda":
+            torch.cuda.synchronize()
         print(f"Finished compilation")
 
         if isinstance(dataset_tokenized, Dataset):
@@ -94,16 +152,50 @@ class preTrain:
         else:
             dataset = load_from_disk(dataset_tokenized)
         dataset = dataset.with_format("torch")
+        self.data_fingerprint = dataset._fingerprint
+        self.seed = seed
         n = len(dataset)
         train_slice = dataset.select(range(int(n * 0.90)))
         val_slice = dataset.select(range(int(n * 0.90), int(n * 0.95)))
         test_slice = dataset.select(range(int(n * 0.95), n))
 
+        source = (
+            str(Path(dataset_tokenized).resolve())
+            if not isinstance(dataset_tokenized, Dataset)
+            else None
+        )
+
+        for split, context in [
+            (train_slice, "training"),
+            (val_slice, "validation"),
+            (test_slice, "testing"),
+        ]:
+            tracked = from_huggingface(
+                split,
+                source=source,
+                name=f"moe-slm-{context}",
+            )
+            mlflow.log_input(tracked, context=context)
+
+
+        mlflow.log_dict(
+            {
+                "sources": ["lapkaaaa/smol-10B"],
+                "revision": "v1",
+                "tokenizer": "tokenizer-32768",
+            },
+            "data/dataset_data.json",
+        )
+
         muon_params = self.get_muon_params(model)
         adamw_params = self.get_adamw_params(model, muon_params)
 
+        muon_ids = {id(p) for p in muon_params}
+        for name, p in model.named_parameters():
+            if p.requires_grad:
+                print(f"Optimizer {'Muon' if id(p) in muon_ids else 'AdamW'}: {name} {tuple(p.shape)}")
 
-        self.muon = optim.Muon(
+        self.muon = ExpertMuon(
             muon_params,
             lr=self.LR_MUON,
             momentum=0.95,
@@ -113,6 +205,7 @@ class preTrain:
             adamw_params,
             lr=self.LR_ADAMW,
             weight_decay=0.01,
+            fused=self.device == "cuda",
         )
 
         self.train_dl = self.create_dataloader(
@@ -120,6 +213,7 @@ class preTrain:
             batch=self.BATCH_SIZE,
             num_workers=4,
             shuffle=True,
+            seed=seed,
         )
         self.val_dl = self.create_dataloader(
             val_slice,
@@ -155,6 +249,7 @@ class preTrain:
 
         self.timing = {"bwd": 0.0, "opt": 0.0}
         self.start_epoch = 0
+        self.epoch_batches = 0
         self.best_val_loss = float("inf")
         self.CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -189,11 +284,12 @@ class preTrain:
             p for name, p in model.named_parameters()
             if (
                 p.requires_grad
-                and p.ndim == 2
+                and (p.ndim == 2 or (p.ndim == 3 and name.rsplit(".", 1)[-1] in ("w13", "w2")))
                 and not any(
                     excluded in name.lower()
                     for excluded in (
                         "embed",
+                        "tok_emb",
                         "lm_head",
                         "router",
                     )
@@ -210,18 +306,41 @@ class preTrain:
         ]
 
     @staticmethod
-    def create_dataloader(dataset_slice, batch:int, num_workers:int, shuffle:bool):
+    def create_dataloader(dataset_slice, batch:int, num_workers:int, shuffle:bool, seed:int = 99):
         return DataLoader(
             dataset=dataset_slice,
             batch_size=batch,
             num_workers=num_workers,
             pin_memory=True,
-            shuffle=shuffle,
+            sampler=EpochSampler(dataset_slice, seed) if shuffle else None,
+            generator=torch.Generator().manual_seed(seed),
             drop_last=True,
         )
 
-    def load_checkpoint(self, path: Path):
+    def load_checkpoint(self, path: Path, *, benchmark: bool = False):
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
+
+        if benchmark:
+            # Benchmark updates are disposable and can use a different batch size.
+            self.model.load_state_dict(ckpt["model"])
+            self.adamw.load_state_dict(ckpt["optimizer_adamw"])
+            self.muon.load_state_dict(ckpt["optimizer_muon"])
+            mlflow.log_params({"benchmark_checkpoint": str(path)})
+            return
+
+        progress = ckpt.get("data_progress")
+        if progress is not None and hasattr(self, "data_fingerprint"):
+            expected = (self.data_fingerprint, self.seed, self.BATCH_SIZE, self.GRAD_ACCUM)
+            saved = (progress["dataset"], progress["seed"], progress["batch_size"], progress["grad_accum"])
+            if saved != expected:
+                raise ValueError("Cannot resume: dataset, seed, batch size, or gradient accumulation differs from the checkpoint")
+            batches = progress["batches"]
+            if not 0 <= batches <= len(self.train_dl) or (batches != len(self.train_dl) and batches % self.GRAD_ACCUM):
+                raise ValueError("Cannot resume: checkpoint batch position is invalid")
+            if progress.get("epochs") != self.EPOCHS:
+                warnings.warn("Epoch count changed; the restored scheduler will follow the new training budget.")
+        elif progress is None:
+            warnings.warn("Legacy checkpoint has no data position or shuffle state; resuming restarts the saved epoch and may repeat data.")
 
         self.model.load_state_dict(ckpt["model"])
         self.adamw.load_state_dict(ckpt["optimizer_adamw"])
@@ -232,12 +351,17 @@ class preTrain:
         self.total_tokens = ckpt["tokens_seen"]
         self.best_val_loss = ckpt["best_val_loss"]
         self.start_epoch = ckpt.get("start_epoch", 0)
+        self.epoch_batches = progress["batches"] if progress is not None else 0
+        if "torch_rng_state" in ckpt:
+            torch.set_rng_state(ckpt["torch_rng_state"].cpu())
+        if self.device == "cuda" and ckpt.get("cuda_rng_state") is not None:
+            torch.cuda.set_rng_state_all([state.cpu() for state in ckpt["cuda_rng_state"]])
 
         mlflow.log_params({"resumed_from": str(path)})
 
     def save_checkpoint(self, name: str):
         path = self.CHECKPOINT_DIR / f"{name}.pt"
-        torch.save({
+        state = {
             "model": self.model.state_dict(),
             "optimizer_adamw": self.adamw.state_dict(),
             "optimizer_muon": self.muon.state_dict(),
@@ -246,18 +370,39 @@ class preTrain:
             "tokens_seen": self.total_tokens,
             "best_val_loss": self.best_val_loss,
             "start_epoch": self.start_epoch,
-        }, path)
+            "torch_rng_state": torch.get_rng_state(),
+            "cuda_rng_state": torch.cuda.get_rng_state_all() if self.device == "cuda" else None,
+        }
+        if hasattr(self, "data_fingerprint"):
+            state["data_progress"] = {
+                "dataset": self.data_fingerprint, "seed": self.seed,
+                "batch_size": self.BATCH_SIZE, "grad_accum": self.GRAD_ACCUM,
+                "epochs": self.EPOCHS, "batches": self.epoch_batches,
+            }
+        temporary = path.with_suffix(".pt.tmp")
+        torch.save(state, temporary)
+        os.replace(temporary, path)
+        offloader = getattr(self, "offloader", None)
+        if offloader is not None:
+            try:
+                offloader.enqueue(path)
+            except (OSError, RuntimeError) as exc:
+                print(f"[offload] could not queue {path.name}: {exc}; local checkpoint remains available", flush=True)
         return path
 
     def run_epoch(
         self,
         loader,
         train=True,
+        benchmark_steps=0,
+        benchmark_warmup=5,
     ):
         self.model.train(train)
 
         if len(loader) == 0:
             raise ValueError("DataLoader is empty")
+        if benchmark_steps and (not train or not 0 <= benchmark_warmup < benchmark_steps):
+            raise ValueError("Benchmark requires training steps after warmup")
 
         total_loss = torch.zeros((), device=self.device)
         total_aux_loss = torch.zeros_like(total_loss)
@@ -298,20 +443,30 @@ class preTrain:
 
             accum = self.GRAD_ACCUM if train else 1
             n_steps = math.ceil(len(loader) / accum)
+            if benchmark_steps:
+                if n_steps < benchmark_steps:
+                    raise ValueError("Not enough batches for the benchmark")
+                n_steps = benchmark_steps
+            benchmark_tokens = 0
             progress.update(task, total=n_steps)
 
             it = iter(loader)
             for step in range(n_steps):
+                if benchmark_steps and step == benchmark_warmup:
+                    if self.device == "cuda":
+                        torch.cuda.synchronize()
+                        torch.cuda.reset_peak_memory_stats()
+                    benchmark_start = time.perf_counter()
                 micros = list(itertools.islice(it, accum))
                 if not micros:
                     break
 
-                should_log = (
+                should_log = not benchmark_steps and (
                     (step + 1) % self.LOG_EVERY == 0
                     or step + 1 == n_steps
                 )
 
-                if train and step + 1 == self.TIME_STEPS:
+                if train and not benchmark_steps and step + 1 == self.TIME_STEPS:
                     t = self.timing
                     total = t["bwd"] + t["opt"]
                     print(
@@ -321,8 +476,12 @@ class preTrain:
                         f"optimizer: {t['opt']:.2f}s ({t['opt']/total*100:.1f}%)"
                     )
                 if train:
-                    self.adamw.zero_grad(set_to_none=True)
-                    self.muon.zero_grad(set_to_none=True)
+                    self.adamw.zero_grad(set_to_none=accum == 1)
+                    self.muon.zero_grad(set_to_none=accum == 1)
+                    if accum > 1:
+                        for p in self.model.parameters():
+                            if p.requires_grad and p.grad is None:
+                                p.grad = torch.zeros_like(p)
 
                 step_loss = torch.zeros((), device=self.device)
                 step_aux = torch.zeros_like(step_loss)
@@ -331,7 +490,7 @@ class preTrain:
                 step_tok = 0
 
                 # skip the first few steps: they absorb torch.compile recompiles
-                profile = train and 5 <= step < self.TIME_STEPS
+                profile = train and not benchmark_steps and 5 <= step < self.TIME_STEPS
                 for batch in micros:
                     batch = {
                         k: v.to(self.device, non_blocking=True)
@@ -341,13 +500,11 @@ class preTrain:
                     t0 = time.perf_counter()
                     with torch.set_grad_enabled(train):
                         with torch.autocast("cuda", dtype=self.precision):
-                            logits, aux_loss, z_loss = self.model(
-                                input_ids=batch["input_ids"]
+                            lm_loss, aux_loss, z_loss = self.model(
+                                input_ids=batch["input_ids"],
+                                labels=batch["input_ids"],
+                                ce_chunk=self.CE_CHUNK,
                             )
-
-                        lm_loss = chunked_cross_entropy(
-                            logits, batch["input_ids"], chunk=self.CE_CHUNK
-                        )
 
                         loss = (
                             lm_loss
@@ -376,6 +533,8 @@ class preTrain:
                     step_aux / len(micros), step_z / len(micros),
                 )
                 total_tokens += step_tok
+                if benchmark_steps and step >= benchmark_warmup:
+                    benchmark_tokens += step_tok
                 total_loss += loss
                 total_aux_loss += aux_loss
                 total_lm_loss += lm_loss
@@ -384,10 +543,10 @@ class preTrain:
                 grad_norm = None
                 if train:
                     t2 = time.perf_counter()
-                    grad_norm = torch.nn.utils.clip_grad_norm_(
-                        self.model.parameters(),
-                        max_norm=float("inf"),
-                    )
+                    if should_log:
+                        grad_norm = torch.nn.utils.get_total_norm([
+                            p.grad for p in self.model.parameters() if p.grad is not None
+                        ])
 
                     self.adamw.step()
                     self.muon.step()
@@ -395,12 +554,15 @@ class preTrain:
                     self.schedule_adamw.step()
                     self.schedule_muon.step()
 
+                    if not benchmark_steps:
+                        self.epoch_batches += len(micros)
+
                     if profile and self.device == "cuda":
                         torch.cuda.synchronize()
                     if profile:
                         self.timing["opt"] += time.perf_counter() - t2
 
-                    if (step + 1) % self.SAVE_EVERY == 0 or step + 1 == n_steps:
+                    if not benchmark_steps and ((self.epoch_batches // accum) % self.SAVE_EVERY == 0 or step + 1 == n_steps):
                         self.save_checkpoint("latest")
 
                 elapsed = time.perf_counter() - start
@@ -464,6 +626,18 @@ class preTrain:
                             "val/running_lm_loss": (total_lm_loss / (step + 1)).item(),
                         }, step=self.total_tokens + total_tokens)
 
+        if benchmark_steps:
+            if self.device == "cuda":
+                torch.cuda.synchronize()
+            seconds = time.perf_counter() - benchmark_start
+            peak = torch.cuda.max_memory_allocated() / 1024**3 if self.device == "cuda" else 0.0
+            print(
+                f"[benchmark] batch={self.BATCH_SIZE} accum={accum} "
+                f"ce_chunk={self.CE_CHUNK} timed_steps={n_steps - benchmark_warmup} "
+                f"tokens={benchmark_tokens:,} seconds={seconds:.3f} "
+                f"tok/s={benchmark_tokens / seconds:,.0f} peak_allocated={peak:.2f} GiB"
+            )
+
         return (
             (total_loss / (step + 1)).item(),
             (total_aux_loss / (step + 1)).item(),
@@ -491,9 +665,10 @@ class preTrain:
             for batch in loader:
                 batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
                 with torch.autocast("cuda", dtype=self.precision):
-                    logits, aux_loss, z_loss = self.model(input_ids=batch["input_ids"])
-                    lm_loss = chunked_cross_entropy(
-                        logits, batch["input_ids"], chunk=self.CE_CHUNK
+                    lm_loss, aux_loss, z_loss = self.model(
+                        input_ids=batch["input_ids"],
+                        labels=batch["input_ids"],
+                        ce_chunk=self.CE_CHUNK,
                     )
                     total_lm += lm_loss.item()
                     n_batches += 1
@@ -516,11 +691,23 @@ class preTrain:
     def train(self):
         train_vals = {"Train": True, "Val": False}
         print(f"\n{'-' * 50}\nStarting training")
+        ran_epoch = False
         for epoch in range(self.start_epoch, self.EPOCHS):
+            ran_epoch = True
+            self.start_epoch = epoch
+            sampler = self.train_dl.sampler
+            sampler.epoch = epoch
+            sampler.offset = self.epoch_batches * self.BATCH_SIZE
+            if self.epoch_batches:
+                print(f"Resuming epoch {epoch + 1} after {self.epoch_batches} training batches")
             print(f"Epoch {epoch + 1}/{self.EPOCHS}")
 
             for key, flag in train_vals.items():
                 loader = self.train_dl if flag else self.val_dl
+
+                if flag and len(loader) == 0 and self.epoch_batches:
+                    print("Training for this epoch is complete; running validation")
+                    continue
 
                 if self.device == "cuda":
                     torch.cuda.reset_peak_memory_stats()
@@ -567,16 +754,17 @@ class preTrain:
                 }, step=epoch)
 
                 if not flag:
+                    self.start_epoch = epoch + 1
+                    self.epoch_batches = 0
                     if epoch_lm_loss < self.best_val_loss:
                         self.best_val_loss = epoch_lm_loss
                         best_path = self.save_checkpoint("best")
                         mlflow.log_artifact(best_path, artifact_path="checkpoints")
                         mlflow.log_metrics({"best_val_loss": self.best_val_loss}, step=epoch)
                         print(f"! New best val loss, saved {best_path}")
-                    else:
-                        self.save_checkpoint("latest")
+                    self.save_checkpoint("latest")
 
-        if self.start_epoch < self.EPOCHS:
+        if ran_epoch:
             self.run_test()
 
         mlflow.end_run()

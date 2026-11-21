@@ -1,0 +1,147 @@
+import copy
+
+import pytest
+import torch
+import torch.nn.functional as F
+from torch._dynamo.utils import counters
+
+from moe_slm.model import BatchedSwiGLUMoE, MoESLM
+from moe_slm.train import ExpertMuon, preTrain
+
+
+def small_model():
+    return MoESLM(32, d_model=16, n_layers=1, n_q_heads=2, n_kv_heads=1,
+                  num_experts=4, d_ffn=24, max_seq_len=32, attn_implementation="sdpa")
+
+
+def test_balanced_and_collapsed():
+    moe = BatchedSwiGLUMoE(4, 24, d_model=4, top_k=1)
+    with torch.no_grad():
+        moe.router.weight.copy_(20 * torch.eye(4))
+    _, aux, z = moe(torch.eye(4).repeat(8, 1))
+    torch.testing.assert_close(aux, torch.tensor(1.0))
+    assert z.ndim == 0 and torch.isfinite(z)
+    out, aux, z = moe(torch.eye(4)[0].repeat(32, 1))
+    assert out.shape == (32, 4)
+    torch.testing.assert_close(aux, torch.tensor(4.0))
+    assert moe.drop_rate > 0
+    (out.square().mean() + aux + z).backward()
+    assert all(torch.isfinite(p.grad).all() for p in moe.parameters())
+
+
+@pytest.mark.slow
+def test_dynamic_fullgraph_no_recompile():
+    torch._dynamo.reset()
+    counters.clear()
+    model = small_model()
+    compiled = torch.compile(model, dynamic=True, mode="default", fullgraph=True)
+    for batch in (2, 3):
+        logits, aux, z = compiled(torch.randint(32, (batch, 8)))
+        (logits.square().mean() + .01 * aux + .01 * z).backward()
+        model.zero_grad(set_to_none=True)
+        assert counters["stats"]["unique_graphs"] == 1
+        assert not counters["graph_break"]
+
+
+def test_muon_split_updates_and_roundtrips():
+    model = small_model()
+    muon = preTrain.get_muon_params(model)
+    adamw = preTrain.get_adamw_params(model, muon)
+    ids = {id(p) for p in muon}
+    assert not ids.intersection(id(p) for p in adamw)
+    assert len(muon) + len(adamw) == len(list(model.parameters()))
+    moe = model.blocks[0].moe
+    assert id(moe.w13) in ids and id(moe.w2) in ids
+    assert id(model.tok_emb.weight) not in ids
+    assert id(model.lm_head.weight) not in ids
+    assert id(moe.router.weight) not in ids
+    optimizer = ExpertMuon(muon, lr=.01)
+    before = moe.w13.detach().clone()
+    for p in muon:
+        p.grad = torch.randn_like(p)
+    optimizer.step()
+    assert not torch.equal(before, moe.w13)
+    state = copy.deepcopy(optimizer.state_dict())
+    optimizer.load_state_dict(state)
+    optimizer.zero_grad()
+    assert all(p.grad is None for p in muon)
+
+
+def test_expert_layout_loads_legacy_weights_and_preserves_muon_updates():
+    torch.manual_seed(23)
+    model = small_model()
+    legacy = copy.deepcopy(model)
+    # Emulate checkpoint tensors and parameters from the old row-major layout.
+    for block in legacy.blocks:
+        block.moe.w13 = torch.nn.Parameter(block.moe.w13.contiguous())
+        block.moe.w2 = torch.nn.Parameter(block.moe.w2.contiguous())
+    model.load_state_dict(legacy.state_dict())
+    for block in model.blocks:
+        assert block.moe.w13.transpose(1, 2).is_contiguous()
+        assert block.moe.w2.transpose(1, 2).is_contiguous()
+
+    params = preTrain.get_muon_params(model)
+    old_params = preTrain.get_muon_params(legacy)
+    optimizer = ExpertMuon(params, lr=.01)
+    old_optimizer = ExpertMuon(old_params, lr=.01)
+    for _ in range(2):
+        for p, old_p in zip(params, old_params):
+            grad = torch.randn(p.shape)
+            p.grad = torch.empty_like(p).copy_(grad)
+            old_p.grad = grad.clone()
+        optimizer.step()
+        old_optimizer.step()
+        for p, old_p in zip(params, old_params):
+            torch.testing.assert_close(p, old_p, atol=1e-6, rtol=1e-4)
+    ids = torch.randint(32, (2, 8))
+    for actual, expected in zip(model(ids), legacy(ids)):
+        torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-4)
+
+
+@pytest.mark.slow
+def test_random_dataset_50_steps():
+    torch.manual_seed(17)
+    model = small_model()
+    muon = preTrain.get_muon_params(model)
+    optimizers = [ExpertMuon(muon, lr=.01),
+                  torch.optim.AdamW(preTrain.get_adamw_params(model, muon), lr=.01)]
+    data = torch.randint(32, (8, 8))
+    losses = []
+    for _ in range(50):
+        for optimizer in optimizers:
+            optimizer.zero_grad()
+        logits, aux, z = model(data)
+        loss = F.cross_entropy(logits[:, :-1].reshape(-1, 32), data[:, 1:].reshape(-1))
+        loss = loss + preTrain.AUX_COEF * aux + preTrain.Z_COEF * z
+        assert torch.isfinite(loss)
+        losses.append(loss.item())
+        loss.backward()
+        for optimizer in optimizers:
+            optimizer.step()
+    assert sum(losses[-5:]) < sum(losses[:5])
+    print(f"50-step random dataset loss: {losses[0]:.4f} -> {losses[-1]:.4f}")
+
+
+@pytest.mark.parametrize("training", [False, True])
+def test_capacity_overflow_preserves_prefix(training):
+    from moe_slm.model import TransformerBlock
+
+    block = TransformerBlock(4, 2, 1, 2, 24, 1,
+                             max_seq_len=8, attn_implementation="sdpa")
+    block.train(training)
+    with torch.no_grad():
+        block.attn.o_proj.weight.zero_()
+        block.moe.router.weight.zero_()
+        block.moe.router.weight[:, 0].copy_(torch.tensor([5., -5.]))
+        block.moe.w13.fill_(.1)
+        block.moe.w2.fill_(.1)
+    original = torch.ones(2, 8, 4)
+    original[:, 4:, 0] = -1
+    changed = original.clone()
+    changed[:, 4:, 0] = 1
+    before = block(original, None, None, None)[0]
+    after = block(changed, None, None, None)[0]
+    assert block.moe.drop_rate > 0
+    torch.testing.assert_close(before[:, :4], after[:, :4], atol=1e-6, rtol=1e-5)
+    after.square().mean().backward()
+    assert torch.isfinite(block.moe.w13.grad).all()

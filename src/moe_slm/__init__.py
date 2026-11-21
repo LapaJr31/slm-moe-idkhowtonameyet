@@ -1,23 +1,60 @@
 import os
+import argparse
 
 from pathlib import Path
 
 from transformers import AutoTokenizer
+from datasets import load_from_disk
 
 from .model import MoESLM
 from .dataset import Dataset_Mixed
 from .tokenizer import BPETokenizer, train_bpe_on_mix
 from .train import preTrain
 
-VOCAB_SIZE = 50000
+VOCAB_SIZE = 32768
 SEQLEN = preTrain.SEQLEN
-SUBSAMPLE_TOKENS = 100e6
+SUBSAMPLE_TOKENS = False
+TOKENIZER_PATH = "tokenizers/smol-data-1b-50k"
+
+
+def build_model(*, attn_implementation: str = "flex") -> MoESLM:
+    return MoESLM(
+        vocab_size=VOCAB_SIZE,
+        d_model=768,
+        n_layers=12,
+        n_q_heads=12,
+        n_kv_heads=4,
+        num_experts=8,
+        d_ffn=960,
+        top_k=2,
+        attn_implementation=attn_implementation,
+    )
 
 
 def main():
-    from datasets import load_from_disk
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--benchmark-batch-size", type=int,
+        help="Benchmark this micro-batch size; sizes up to 64 must divide 64.",
+    )
+    parser.add_argument("--offload-host", help="SSH host alias or user@host for checkpoint offloading")
+    parser.add_argument("--offload-dir", help="Absolute checkpoint destination directory on the SSH host")
+    args = parser.parse_args()
+    if (args.offload_host is None) != (args.offload_dir is None):
+        parser.error("--offload-host and --offload-dir must be provided together")
+    if args.offload_host is not None and args.benchmark_batch_size is not None:
+        parser.error("checkpoint offloading is not used during benchmarks")
+    if args.offload_host is not None and (not args.offload_host or args.offload_host.startswith("-") or not args.offload_dir.startswith("/")):
+        parser.error("offload host must be a valid SSH destination and offload directory must be absolute")
+    if args.benchmark_batch_size is not None:
+        if args.benchmark_batch_size < 1 or (
+            args.benchmark_batch_size < 64 and 64 % args.benchmark_batch_size
+        ):
+            parser.error("benchmark batch size must be positive and divide 64 when below 64")
+        preTrain.BATCH_SIZE = args.benchmark_batch_size
+        preTrain.GRAD_ACCUM = max(1, 64 // args.benchmark_batch_size)
 
-    out = "tokenizers/smol-data-1b-50k"
+    out = TOKENIZER_PATH
     ds_path = Path("dataset/")
     have_tokenizer = os.path.exists(os.path.join(out, "tokenizer.json"))
     have_dataset = ds_path.exists()
@@ -33,8 +70,9 @@ def main():
     else:
         mix = Dataset_Mixed(
             testing=True,
-            total_tokens_b=1.0,
+            total_tokens_b=10.0,
             tokenizer="HuggingFaceTB/SmolLM2-1.7B",
+            num_workers=5,
         )
 
         if have_tokenizer:
@@ -63,19 +101,25 @@ def main():
 
     latest_ckpt = Path("checkpoints/latest.pt")
     if latest_ckpt.exists():
-        print(f"resuming from checkpoint {latest_ckpt}")
+        print(f"{'loading benchmark state' if args.benchmark_batch_size is not None else 'resuming'} from checkpoint {latest_ckpt}")
 
-    model = MoESLM(
-        vocab_size=VOCAB_SIZE,
-        d_model=1024,
-        n_layers=13,
-        n_q_heads=16,
-        n_kv_heads=4,
-        num_experts=8,
-        d_ffn=4224,
-        top_k=2,
-    )
-    trainer = preTrain(ds, model, run_type="rehearsal_100m")
-    if latest_ckpt.exists():
-        trainer.load_checkpoint(latest_ckpt)
-    trainer.train()
+    model = build_model()
+    trainer = preTrain(ds, model, run_type="benchmark_batch" if args.benchmark_batch_size is not None else "benchmarking_CE")
+    offloader = None
+    try:
+        if latest_ckpt.exists():
+            trainer.load_checkpoint(latest_ckpt, benchmark=args.benchmark_batch_size is not None)
+        if args.offload_host is not None:
+            from .checkpoint_offload import CheckpointOffloader
+
+            offloader = CheckpointOffloader(trainer.CHECKPOINT_DIR, args.offload_host, args.offload_dir)
+            trainer.offloader = offloader
+        if args.benchmark_batch_size is not None:
+            trainer.run_epoch(trainer.train_dl, benchmark_steps=15)
+        else:
+            trainer.train()
+    finally:
+        if offloader is not None:
+            offloader.close()
+        import mlflow
+        mlflow.end_run()

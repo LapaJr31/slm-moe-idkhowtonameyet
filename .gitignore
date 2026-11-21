@@ -24,3 +24,15 @@ mlartifacts/1/8ff3ba257e2440849b5c298dc22dc755/artifacts/checkpoints/
 runpodsetup.sh
 checkpoints_dry_v2.tar.zst
 .pytest_cache/
+dataset_bak/
+mlartifacts/1/
+tokenizers_bak/smol-data-1b-50k/
+junk/
+archives/
+checkpoints/
+report1.nsys-rep
+profiling/report1.sqlite
+profiling/
+
+*.log
+tokenizers/skynet-32768/
