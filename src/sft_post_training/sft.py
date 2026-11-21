@@ -41,26 +41,21 @@ class SFT_Post_train:
         self,
         model_id : str,
         output_dir : str,
-        attn_imp: str = "sdpa",
+        attn_imp: ATTN | str = ATTN.SDPA,
         seed: int = 42,
         run_type: str = "dry_run"
     ):
 
-        if not isinstance(attn_imp, ATTN):
+        try:
+            attn_imp = ATTN(attn_imp)
+        except ValueError as exc:
             raise ValueError(
-                """
-                Invalid attention implementation. Only allowed values are:
-                - "flash_attention_2"
-                - "flash_attention_3"
-                - "flash_attention_4"
-                - "sdpa"
-                """
-            )
+                "attn_imp must be one of: flash_attention_2, flash_attention_3, flash_attention_4, sdpa"
+            ) from exc
+
         self.output_dir = output_dir
         self.seed = seed
 
-        mlflow.set_experiment("skynet-sft-posttrain")
-        mlflow.start_run(run_name=f"posttrain-{run_type}")
         mlflow.set_tag("run_type", run_type)
         mlflow.log_params({
             "epochs" : self.EPOCHS,
@@ -116,13 +111,13 @@ class SFT_Post_train:
 
         self.training_args = SFTConfig(
             output_dir=output_dir,
-            num_train_epochs=2,
+            num_train_epochs=self.EPOCHS,
 
             per_device_train_batch_size=self.MICRO_BATCH,
             gradient_accumulation_steps=self.EFFECTIVE_BATCH// (self.MICRO_BATCH * world_size),
             per_device_eval_batch_size=self.EFFECTIVE_BATCH,
 
-            learning_rate=5e-5,
+            learning_rate=self.LR,
             lr_scheduler_type="cosine",
             optim="adamw_torch_fused",
             warmup_steps=0.03,
@@ -138,14 +133,14 @@ class SFT_Post_train:
             completion_only_loss=False,
             assistant_only_loss=True,
 
-            eval_strategy="no",
+            eval_strategy="epoch",
 
             remove_unused_columns=True,
             label_names=["labels"],
 
-            logging_steps=50,
+            logging_steps=self.LOG_EVERY,
             save_strategy="steps",
-            save_steps=100,
+            save_steps=self.SAVE_EVERY,
             save_total_limit=4,
 
             dataloader_num_workers=4,
@@ -163,29 +158,29 @@ class SFT_Post_train:
             torch_compile_mode="max-autotune"
         )
 
-    def init_dataset(self, dataset_id, cache_dir, subset=None, split=None):
+    def init_dataset(self, dataset_id, subset=None, split="train"):
         mlflow.log_dict(
             {
                 "source": [f"{dataset_id}"],
                 "subset": [f"{subset}"],
                 "split": [f"{split}"],
-                "revision": "v1",
             },
             "data/dataset_data.json"
         )
-        return load_dataset(dataset_id, name=subset, split=split)
+        ds = load_dataset(dataset_id, name=subset, split=split).shuffle(seed=self.seed)
+        train_slice = ds.select(range(int(len(ds) * 0.98)))
+        eval_slice = ds.select(range(int(len(ds) * 0.98), len(ds)))
+        return train_slice, eval_slice
 
-    def train(self, dataset):
+    def train(self, train_dataset, eval_dataset):
         trainer = SFTTrainer(
             model=self.model,
             args=self.training_args,
-            train_dataset=dataset,
+            train_dataset=train_dataset,
+            eval_dataset= eval_dataset,
             processing_class=self.tokenizer,
         )
 
-        try:
-            trainer.train()
-            trainer.save_model(self.output_dir)
-            self.tokenizer.save_pretrained(self.output_dir)
-        finally:
-            mlflow.end_run()
+        trainer.train()
+        trainer.save_model(self.output_dir)
+        self.tokenizer.save_pretrained(self.output_dir)

@@ -12,6 +12,7 @@ dependencies = [
     "scikit-learn>=1.9.1",
     "tokenizers>=0.23.3",
     "transformers>=5.22.2",
+    "trl>=1.18.2",
     "unsloth>=2025.7.2",
 ]
 
@@ -24,6 +25,7 @@ markers = [
 
 [project.scripts]
 moe_slm = "moe_slm:main"
+sft_post_training = "sft_post_training:main"
 
 [build-system]
 requires = ["uv_build>=0.13.5,<0.14.0"]

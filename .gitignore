@@ -36,3 +36,4 @@ profiling/
 
 *.log
 tokenizers/skynet-32768/
+.env
