@@ -4,13 +4,11 @@ version = "0.1.0"
 requires-python = "==3.13.*"
 dependencies = [
     "accelerate",
-    "bitsandbytes",
     "datasets",
     "numpy>=2.5.2",
+    "sft-post-training",
     "transformers==5.17.0",
-    "scikit-learn>=1.9.1",
     "unsloth",
-    "peft",
     "torch==2.11.0",
     "torchvision==0.26.0",
     "flash-attn-3==3.0.0b1+cu.13.0.torch.2.11",
@@ -35,6 +33,7 @@ explicit = true
 prerelease = "allow"
 
 [tool.uv.sources]
+sft-post-training = { path = "../../src", editable = true }
 torch = { index = "pytorch-cu130" }
 torchvision = { index = "pytorch-cu130" }
 flash-attn-3 = { index = "astral-cu130" }

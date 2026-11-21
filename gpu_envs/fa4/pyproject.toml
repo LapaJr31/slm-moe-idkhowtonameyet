@@ -4,11 +4,10 @@ version = "0.1.0"
 requires-python = "==3.13.*"
 dependencies = [
     "accelerate",
-    "bitsandbytes",
     "datasets",
     "numpy>=2.5.2",
+    "sft-post-training",
     "transformers==5.17.0",
-    "scikit-learn>=1.9.1",
     "unsloth",
     "torch==2.14.0",
     "torchvision==0.29.0",
@@ -35,6 +34,7 @@ explicit = true
 prerelease = "allow"
 
 [tool.uv.sources]
+sft-post-training = { path = "../../src", editable = true }
 torch = { index = "pytorch-cu130" }
 torchvision = { index = "pytorch-cu130" }
 flash-attn-4 = { git = "https://github.com/Dao-AILab/flash-attention", subdirectory = "flash_attn/cute", rev = "fa4-v4.0.0.beta34" }

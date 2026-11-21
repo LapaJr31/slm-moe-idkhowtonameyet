@@ -10,6 +10,7 @@ dependencies = [
     "mlflow",
     "numpy>=2.5.2",
     "scikit-learn>=1.9.1",
+    "sft-post-training",
     "tokenizers>=0.23.3",
     "transformers>=5.22.2",
     "trl>=1.18.2",
@@ -25,7 +26,6 @@ markers = [
 
 [project.scripts]
 moe_slm = "moe_slm:main"
-sft_post_training = "sft_post_training:main"
 
 [build-system]
 requires = ["uv_build>=0.13.5,<0.14.0"]
@@ -71,6 +71,7 @@ explicit = true
 prerelease = "allow"
 
 [tool.uv.sources]
+sft-post-training = { path = "src", editable = true }
 torch = [
     { index = "pytorch-cpu", extra = "cpu" },
     { index = "pytorch-cu130", extra = "cu130" },
@@ -81,4 +82,4 @@ torchvision = [
 ]
 
 [tool.uv.workspace]
-exclude = ["gpu-envs/*"]
+exclude = ["gpu_envs/*", "src"]
