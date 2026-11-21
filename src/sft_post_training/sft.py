@@ -128,8 +128,8 @@ class SFT_Post_train:
 
             report_to=["mlflow"],
 
-            # torch_compile=has_cuda,
-            # torch_compile_mode="max-autotune" if has_cuda else None,
+            torch_compile=has_cuda,
+            torch_compile_mode="max-autotune" if has_cuda else None,
         )
 
     def tokenize_batch(self, batch):
