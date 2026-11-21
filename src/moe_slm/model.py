@@ -73,23 +73,26 @@ def get_padded_block_mask(attention_mask: torch.Tensor):
 
 
 def get_sdpa_additive_mask(attention_mask: torch.Tensor, dtype: torch.dtype):
-    key = ("sdpa_additive", *_mask_fingerprint(attention_mask), str(dtype))
-    mask = _MASK_CACHE.get(key)
-    if mask is None:
-        B, T = attention_mask.shape
-        am = attention_mask.detach().to(torch.bool)
-        allow = torch.ones(T, T, dtype=torch.bool, device=am.device).tril()
-        allow = allow & am[:, None, None, :]
+    key = None
+    if not torch.compiler.is_compiling():
+        key = ("sdpa_additive", *_mask_fingerprint(attention_mask), str(dtype))
+        cached_mask = _MASK_CACHE.get(key)
+        if cached_mask is not None:
+            return cached_mask
 
-        fully_masked = am.cumsum(-1) == 0                       # [B, T]
-        diag = torch.eye(T, dtype=torch.bool, device=am.device)[None, None]
-        allow = allow | (diag & fully_masked[:, None, :, None])  # [B, 1, T, T]
-        mask = _mask_cache_put(
-            key,
-            torch.zeros(B, 1, T, T, dtype=dtype, device=am.device).masked_fill_(
-                ~allow, torch.finfo(dtype).min
-            ),
-        )
+    B, T = attention_mask.shape
+    am = attention_mask.detach().to(torch.bool)
+    allow = torch.ones(T, T, dtype=torch.bool, device=am.device).tril()
+    allow = allow & am[:, None, None, :]
+
+    fully_masked = am.cumsum(-1) == 0                       # [B, T]
+    diag = torch.eye(T, dtype=torch.bool, device=am.device)[None, None]
+    allow = allow | (diag & fully_masked[:, None, :, None])  # [B, 1, T, T]
+    mask = torch.zeros(B, 1, T, T, dtype=dtype, device=am.device).masked_fill_(
+        ~allow, torch.finfo(dtype).min
+    )
+    if key is not None:
+        _mask_cache_put(key, mask)
     return mask
 
 
@@ -499,7 +502,8 @@ class MoESLM(nn.Module):
         )
 
     def forward(self, input_ids, attention_mask=None, labels=None, ce_chunk=8192, *, kv_cache=None):
-        if attention_mask is not None and bool(attention_mask.all()):
+        compiled_sdpa = torch.compiler.is_compiling() and self.attn_implementation == "sdpa" and kv_cache is None
+        if attention_mask is not None and not compiled_sdpa and bool(attention_mask.all()):
             attention_mask = None
 
         if kv_cache is not None:

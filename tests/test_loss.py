@@ -37,18 +37,25 @@ def test_chunked_projection_loss_and_gradients(device, chunk, ignored, bf16):
 
 @pytest.mark.parametrize("compiled", [False, True])
 @pytest.mark.parametrize("tied", [False, True])
-def test_model_loss_path_matches_logits_and_all_gradients(compiled, tied):
+@pytest.mark.parametrize("mask_kind", [None, "all_tokens", "padded"])
+def test_model_loss_path_matches_logits_and_all_gradients(compiled, tied, mask_kind):
     torch.manual_seed(13)
     model = tiny_model(attn_implementation="sdpa", tie_embeddings=tied)
     ids = random_batch(batch_size=2, seqlen=5)["input_ids"]
-    logits, aux, z = model(ids)
-    expected = chunked_cross_entropy(logits, ids) + 0.01 * (aux + z)
+    attention_mask = None if mask_kind is None else torch.ones_like(ids)
+    labels = ids
+    if mask_kind == "padded":
+        attention_mask[0, :2] = 0
+        attention_mask[1, -1] = 0
+        labels = ids.masked_fill(attention_mask == 0, -100)
+    logits, aux, z = model(ids, attention_mask=attention_mask)
+    expected = chunked_cross_entropy(logits, labels) + 0.01 * (aux + z)
     expected.backward()
     grads = {name: p.grad.clone() for name, p in model.named_parameters()}
     model.zero_grad(set_to_none=True)
     # AOTAutograd exercises compiled forward/backward without GPU codegen.
     run = torch.compile(model, backend="aot_eager", fullgraph=True, dynamic=False) if compiled else model
-    lm, aux, z = run(ids, labels=ids, ce_chunk=3)
+    lm, aux, z = run(ids, attention_mask=attention_mask, labels=labels, ce_chunk=3)
     actual = lm + 0.01 * (aux + z)
     actual.backward()
     torch.testing.assert_close(actual, expected)
