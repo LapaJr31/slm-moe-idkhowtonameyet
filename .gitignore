@@ -25,7 +25,7 @@ runpodsetup.sh
 checkpoints_dry_v2.tar.zst
 .pytest_cache/
 dataset_bak/
-mlartifacts/1/
+mlartifacts/
 tokenizers_bak/smol-data-1b-50k/
 junk/
 archives/

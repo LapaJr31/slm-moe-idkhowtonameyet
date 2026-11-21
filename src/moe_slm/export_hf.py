@@ -9,11 +9,17 @@ from . import build_model
 from .modeling_moe_slm import MoESLMConfig, MoESLMForCausalLM
 
 
-def export_model(checkpoint_path: Path, tokenizer_source: str, output_dir: Path) -> None:
+def export_model(
+    checkpoint_path: Path,
+    tokenizer_source: str,
+    output_dir: Path,
+    *,
+    tokenizer_subfolder: str = "",
+) -> None:
     if output_dir.exists() and (not output_dir.is_dir() or any(output_dir.iterdir())):
         raise ValueError(f"Export requires an empty output directory: {output_dir}")
 
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_source)
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_source, subfolder=tokenizer_subfolder)
     with torch.device("meta"):
         native = build_model(attn_implementation="sdpa").config
     if max(tokenizer.get_vocab().values()) >= native["vocab_size"]:
@@ -54,12 +60,15 @@ def main():
     parser.add_argument("--checkpoint", required=True, help="Local .pt path or Hub filename")
     parser.add_argument("--checkpoint-repo", help="Hub repo containing --checkpoint")
     parser.add_argument("--tokenizer", required=True, help="Tokenizer directory or Hub repo ID")
+    parser.add_argument("--tokenizer-subfolder", default="", help="Tokenizer path within the directory or Hub repo")
     parser.add_argument("--output-dir", required=True, type=Path)
     args = parser.parse_args()
     checkpoint_path = args.checkpoint
     if args.checkpoint_repo:
         checkpoint_path = hf_hub_download(repo_id=args.checkpoint_repo, filename=checkpoint_path)
-    export_model(Path(checkpoint_path), args.tokenizer, args.output_dir)
+    export_model(
+        Path(checkpoint_path), args.tokenizer, args.output_dir, tokenizer_subfolder=args.tokenizer_subfolder,
+    )
 
 
 if __name__ == "__main__":

@@ -146,7 +146,7 @@ class SFT_Post_train:
         ]
         return encoded
 
-    def init_dataset(self, dataset_id, subset=None, split="train"):
+    def init_dataset(self, dataset_id, subset=None, split="train", *, data_files=None):
         mlflow.log_dict(
             {
                 "source": [f"{dataset_id}"],
@@ -155,11 +155,13 @@ class SFT_Post_train:
             },
             "data/dataset_data.json"
         )
-        ds = load_dataset(dataset_id, name=subset, split=split)
+
+        if data_files is None:
+            ds = load_dataset(dataset_id, name=subset, split=split)
+        else:
+            ds = load_dataset("parquet", data_files={split: data_files}, split=split)
         ds = ds.map(self.tokenize_batch, batched=True, remove_columns=ds.column_names)
         ds = ds.filter(lambda example: any(label != -100 for label in example["labels"][1:]))
-        if len(ds) < 2:
-            raise ValueError("SFT requires at least two examples with assistant tokens after truncation")
         splits = ds.train_test_split(test_size=0.02, seed=self.seed)
         return splits["train"], splits["test"]
 

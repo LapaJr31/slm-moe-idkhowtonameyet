@@ -8,9 +8,10 @@ Export a checkpoint produced by this repo with its original tokenizer. Pass a
 local tokenizer directory or its Hugging Face repo ID.
 
 ```sh
-uv run moe_slm_export \
+uv run --env-file .env moe_slm_export \
   --checkpoint checkpoints/best.pt \
   --tokenizer lapkaaaa/skynet_0.1_not_killing_anybody_yet \
+  --tokenizer-subfolder tokenizers/skynet-32768 \
   --output-dir checkpoints/skynet-hf
 ```
 

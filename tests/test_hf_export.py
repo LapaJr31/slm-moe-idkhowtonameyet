@@ -1,3 +1,4 @@
+import pytest
 import torch
 from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
@@ -7,7 +8,8 @@ from moe_slm import export_hf
 from moe_slm.model import MoESLM
 
 
-def test_export_compiled_checkpoint_with_tied_weights(tmp_path, monkeypatch):
+@pytest.mark.parametrize("tokenizer_subfolder", ["", "tokenizers/skynet-32768"])
+def test_export_compiled_checkpoint_with_tied_weights(tmp_path, monkeypatch, tokenizer_subfolder):
     def build_model(*, attn_implementation):
         return MoESLM(
             vocab_size=8, d_model=16, n_layers=1, n_q_heads=2, n_kv_heads=1,
@@ -21,14 +23,15 @@ def test_export_compiled_checkpoint_with_tied_weights(tmp_path, monkeypatch):
     original = build_model(attn_implementation="sdpa").eval()
     checkpoint = tmp_path / "best.pt"
     torch.save({"model": {f"_orig_mod.{name}": value for name, value in original.state_dict().items()}}, checkpoint)
-    tokenizer_dir = tmp_path / "tokenizer"
+    tokenizer_source = tmp_path / "tokenizer-source"
+    tokenizer_dir = tokenizer_source / tokenizer_subfolder
     tokenizer = PreTrainedTokenizerFast(
         tokenizer_object=Tokenizer(WordLevel({"<eos>": 0, "hello": 1})), eos_token="<eos>",
     )
     tokenizer.save_pretrained(tokenizer_dir)
 
     output = tmp_path / "export"
-    export_hf.export_model(checkpoint, str(tokenizer_dir), output)
+    export_hf.export_model(checkpoint, str(tokenizer_source), output, tokenizer_subfolder=tokenizer_subfolder)
     model = AutoModelForCausalLM.from_pretrained(output, trust_remote_code=True)
     tokenizer = AutoTokenizer.from_pretrained(output, config=model.config)
 

@@ -10,6 +10,7 @@ from .sft import SFT_Post_train
 DATASET_ID = "HuggingFaceTB/smoltalk2"
 SUBSET = "SFT"
 SPLIT = "tulu_3_sft_personas_instruction_following_no_think"
+DATA_FILES = f"hf://datasets/{DATASET_ID}/{SUBSET}/{SPLIT}-*.parquet"
 
 
 SEED = 42
@@ -41,9 +42,10 @@ def main():
         )
 
         train, val = trainer.init_dataset(
-            dataset_id = DATASET_ID,
+            dataset_id=DATASET_ID,
             subset=SUBSET,
             split=SPLIT,
+            data_files=DATA_FILES,
         )
 
         trainer.train(
