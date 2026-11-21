@@ -6,6 +6,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenize
 
 from moe_slm import export_hf
 from moe_slm.model import MoESLM
+from sft_post_training import sft
 
 
 @pytest.mark.parametrize("tokenizer_subfolder", ["", "tokenizers/skynet-32768"])
@@ -48,3 +49,33 @@ def test_export_compiled_checkpoint_with_tied_weights(tmp_path, monkeypatch, tok
             model(input_ids, labels=input_ids, loss_only=True, num_items_in_batch=4).loss,
             model(input_ids, labels=input_ids).loss / 2,
         )
+
+    monkeypatch.setattr(sft.mlflow, "set_tag", lambda *args: None)
+    monkeypatch.setattr(sft.mlflow, "log_params", lambda *args: None)
+    pipeline = sft.SFT_Post_train(str(output), str(tmp_path / "sft"), trust_remote_code=True)
+    attention_mask = torch.tensor([[1, 1, 0]])
+    labels = input_ids.masked_fill(attention_mask == 0, -100)
+    inputs = dict(input_ids=input_ids, attention_mask=attention_mask, labels=labels, loss_only=True)
+    original_experts = model.model.blocks[0].moe
+    loaded_experts = pipeline.model.model.blocks[0].moe
+    weights_before = (original_experts.w13, original_experts.w2)
+    weights_after = (loaded_experts.w13, loaded_experts.w2)
+    for before, after in zip(weights_before, weights_after, strict=True):
+        assert after.transpose(-1, -2).is_contiguous()
+        assert (after.dtype, after.device, after.requires_grad) == (before.dtype, before.device, before.requires_grad)
+        torch.testing.assert_close(after, before, rtol=0, atol=0)
+
+    expected = model(**inputs).loss
+    pipeline.model.train()
+    pipeline.model.gradient_checkpointing_enable()
+    compiled = torch.compile(pipeline.model, backend="aot_eager", fullgraph=True)
+    actual = compiled(**inputs).loss
+    torch.testing.assert_close(actual, expected)
+    gradients_before = torch.autograd.grad(expected, weights_before)
+    gradients_after = torch.autograd.grad(actual, weights_after)
+    for before, after in zip(gradients_before, gradients_after, strict=True):
+        torch.testing.assert_close(after, before)
+
+    sft._restore_expert_weight_layout(pipeline.model)
+    assert loaded_experts.w13 is weights_after[0]
+    assert loaded_experts.w2 is weights_after[1]

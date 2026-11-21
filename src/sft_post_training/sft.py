@@ -12,6 +12,17 @@ from transformers import (
 )
 
 
+def _restore_expert_weight_layout(model):
+    for block in model.model.blocks:
+        for name in ("w13", "w2"):
+            weight = getattr(block.moe, name)
+            operand = weight.detach().transpose(-1, -2)
+            if not operand.is_contiguous():
+                # Match the native layout without making a copy on every bmm.
+                restored = operand.contiguous().transpose(-1, -2)
+                setattr(block.moe, name, torch.nn.Parameter(restored, requires_grad=weight.requires_grad))
+
+
 class MoESLMTrainer(Trainer):
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         return super().compute_loss(
@@ -57,6 +68,8 @@ class SFT_Post_train:
         self.model = AutoModelForCausalLM.from_pretrained(
             model_id, trust_remote_code=trust_remote_code, attn_implementation="sdpa",
         )
+        if self.model.config.model_type == "moe_slm":
+            _restore_expert_weight_layout(self.model)
         self.tokenizer = AutoTokenizer.from_pretrained(
             model_id, config=self.model.config, trust_remote_code=trust_remote_code, padding_side="right",
         )
