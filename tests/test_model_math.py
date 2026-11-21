@@ -187,3 +187,38 @@ def test_future_tokens_do_not_change_prefix_logits(attention):
         before = model(original)[0]
         after = model(changed)[0]
     torch.testing.assert_close(before[:, :8], after[:, :8], atol=1e-6, rtol=1e-5)
+
+
+@pytest.mark.parametrize("top_p", [None, 0.9])
+def test_kv_cache_matches_full_forward(top_p):
+    model = tiny_model(attn_implementation="sdpa", max_seq_len=4).eval()
+    for block in model.blocks:
+        block.moe.inference_no_drop = True
+        block.moe.top_p = top_p
+    ids = random_batch(batch_size=2, seqlen=10)["input_ids"]
+    cache = model.make_kv_cache(10, max_batch_size=2)
+    with torch.inference_mode():
+        prefill, _, _ = model(ids[:, :4], kv_cache=cache)
+        decode, _, _ = model(ids[:, 4:5], kv_cache=cache)
+        chunk, _, _ = model(ids[:, 5:], kv_cache=cache)
+        expected, _, _ = model(ids)
+    torch.testing.assert_close(torch.cat((prefill, decode, chunk), dim=1), expected, atol=1e-5, rtol=1e-4)
+    assert cache.get(1)[0].shape[-2] == 10
+    assert not cache.state_dict()
+
+
+def test_kv_cache_reset_and_limits():
+    model = tiny_model(attn_implementation="sdpa").eval()
+    ids = random_batch(batch_size=2, seqlen=4)["input_ids"]
+    cache = model.make_kv_cache(4, max_batch_size=2)
+    with torch.inference_mode():
+        prefix, _, _ = model(ids[:1, :3], kv_cache=cache)
+        with pytest.raises(ValueError, match="changing the batch size"):
+            model(ids[:, :1], kv_cache=cache)
+        with pytest.raises(ValueError, match="sequence capacity"):
+            model(ids[:1, :2], kv_cache=cache)
+        assert cache.length == 3
+        cache.reset()
+        assert cache.get(0)[0].size(-2) == 0
+        repeated, _, _ = model(ids[:1, :3], kv_cache=cache)
+    torch.testing.assert_close(repeated, prefix)

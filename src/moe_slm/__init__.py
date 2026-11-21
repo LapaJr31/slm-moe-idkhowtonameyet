@@ -14,6 +14,21 @@ from .train import preTrain
 VOCAB_SIZE = 32768
 SEQLEN = preTrain.SEQLEN
 SUBSAMPLE_TOKENS = False
+TOKENIZER_PATH = "tokenizers/smol-data-1b-50k"
+
+
+def build_model(*, attn_implementation: str = "flex") -> MoESLM:
+    return MoESLM(
+        vocab_size=VOCAB_SIZE,
+        d_model=768,
+        n_layers=12,
+        n_q_heads=12,
+        n_kv_heads=4,
+        num_experts=8,
+        d_ffn=960,
+        top_k=2,
+        attn_implementation=attn_implementation,
+    )
 
 
 def main():
@@ -39,7 +54,7 @@ def main():
         preTrain.BATCH_SIZE = args.benchmark_batch_size
         preTrain.GRAD_ACCUM = max(1, 64 // args.benchmark_batch_size)
 
-    out = "tokenizers/smol-data-1b-50k"
+    out = TOKENIZER_PATH
     ds_path = Path("dataset/")
     have_tokenizer = os.path.exists(os.path.join(out, "tokenizer.json"))
     have_dataset = ds_path.exists()
@@ -88,17 +103,7 @@ def main():
     if latest_ckpt.exists():
         print(f"{'loading benchmark state' if args.benchmark_batch_size is not None else 'resuming'} from checkpoint {latest_ckpt}")
 
-    model = MoESLM(
-        vocab_size=VOCAB_SIZE,
-        d_model=768,
-        n_layers=12,
-        n_q_heads=12,
-        n_kv_heads=4,
-        num_experts=8,
-        d_ffn=960,
-        top_k=2,
-        attn_implementation="flex",
-    )
+    model = build_model()
     trainer = preTrain(ds, model, run_type="benchmark_batch" if args.benchmark_batch_size is not None else "benchmarking_CE")
     offloader = None
     try:
